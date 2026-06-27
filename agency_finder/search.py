@@ -223,6 +223,13 @@ def _search_ddg_lite(query: str, max_results: int = 10) -> List[Dict[str, str]]:
 
 def _search_duckduckgo(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     try:
+        import os as _os
+        try:
+            import certifi as _certifi
+            _os.environ.setdefault("SSL_CERT_FILE", _certifi.where())
+        except Exception:
+            pass
+
         from ddgs import DDGS
 
         time.sleep(0.5)
