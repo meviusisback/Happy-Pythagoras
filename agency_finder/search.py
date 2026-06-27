@@ -2,6 +2,7 @@ import requests
 import time
 import logging
 import urllib.parse
+import re
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any
 from .config import Config
@@ -29,8 +30,65 @@ def search_query(query: str, max_results: int = 10) -> List[Dict[str, str]]:
                 return results
             logger.warning("Google Custom Search failed or returned no results, falling back.")
 
-    # 3. Default/Fallback: DuckDuckGo HTML scraper (thread-safe, zero deadlock risk)
+    # 3. Default: Scrape DuckDuckGo Lite (thread-safe, highly stable, no 202 status blocks)
+    results = _search_ddg_lite(query, max_results)
+    if results:
+        return results
+
+    # 4. Fallback: DuckDuckGo HTML scraper (thread-safe, zero deadlock risk)
     return _search_ddg_html(query, max_results)
+
+
+def _search_ddg_lite(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+    """
+    Scrapes lite.duckduckgo.com/lite/ which is lightweight, text-only,
+    and returns direct clean links without redirects or CAPTCHAs.
+    """
+    results = []
+    url = "https://lite.duckduckgo.com/lite/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "it,en-US;q=0.7,en;q=0.3",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": "https://lite.duckduckgo.com/"
+    }
+    
+    try:
+        # Prevent rapid requests
+        time.sleep(0.5)
+        response = requests.post(url, data={"q": query}, headers=headers, timeout=Config.TIMEOUT)
+        
+        if response.status_code != 200:
+            logger.warning(f"DuckDuckGo Lite search returned HTTP {response.status_code}")
+            return []
+            
+        soup = BeautifulSoup(response.content, "html.parser")
+        
+        # In DDG Lite, results are links with class 'result-link'
+        links = soup.find_all("a", class_="result-link")
+        
+        for idx, link_tag in enumerate(links[:max_results]):
+            title = link_tag.get_text(strip=True)
+            link = link_tag.get("href", "")
+            
+            # Find the corresponding snippet (td class 'result-snippet')
+            snippet = ""
+            snippets = soup.find_all("td", class_="result-snippet")
+            if idx < len(snippets):
+                snippet = snippets[idx].get_text().strip()
+                snippet = re.sub(r"\s+", " ", snippet)
+                
+            results.append({
+                "title": title,
+                "link": link,
+                "snippet": snippet
+            })
+            
+        return results
+    except Exception as e:
+        logger.error(f"DuckDuckGo Lite scrape error: {str(e)}")
+        return []
 
 
 def _search_duckduckgo(query: str, max_results: int = 10) -> List[Dict[str, str]]:
