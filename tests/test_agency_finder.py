@@ -4,7 +4,7 @@ import xml.etree.ElementTree as ET
 from agency_finder.vies import check_vat
 from agency_finder.scraper import WebScraper
 from agency_finder.extractor import InformationExtractor
-from agency_finder.core import find_linkedin_employees
+from agency_finder.core import find_linkedin_employees, scrape_linkedin_company_page
 
 class TestViesClient(unittest.TestCase):
     @patch("requests.post")
@@ -126,11 +126,15 @@ class TestLinkedInEmployees(unittest.TestCase):
             "canticreativo.it",
         )
         queries = [call.args[0] for call in mock_search.call_args_list]
-        self.assertEqual(len(queries), 4)
-        self.assertIn("Cantiere Creativo", queries[0])
-        self.assertIn("Cantiere Creativo", queries[1])
+        self.assertEqual(len(queries), 6)
+        # First three queries should be slug-anchored
+        self.assertIn("cantiere-creativo", queries[0])
+        self.assertIn("cantiere-creativo", queries[1])
         self.assertIn("cantiere-creativo", queries[2])
+        # Then name-based queries
         self.assertIn("Cantiere Creativo", queries[3])
+        self.assertIn("Cantiere Creativo", queries[4])
+        self.assertIn("Cantiere Creativo", queries[5])
 
     @patch("agency_finder.core.search_query")
     def test_dedup_by_url(self, mock_search):
@@ -140,6 +144,8 @@ class TestLinkedInEmployees(unittest.TestCase):
         mock_search.side_effect = [
             [r1],
             [r2],
+            [],
+            [],
             [],
             [],
         ]
@@ -211,6 +217,8 @@ class TestLinkedInEmployees(unittest.TestCase):
             [good],
             [],
             [],
+            [],
+            [],
         ]
         results = find_linkedin_employees(
             "Cantiere Creativo",
@@ -218,6 +226,74 @@ class TestLinkedInEmployees(unittest.TestCase):
         )
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["name"], "Giorgio Bianchi")
+
+
+class TestScrapeLinkedInCompanyPage(unittest.TestCase):
+
+    @patch("agency_finder.core._requests.get")
+    def test_returns_empty_on_network_error(self, mock_get):
+        mock_get.side_effect = ConnectionError("refused")
+        results = scrape_linkedin_company_page("https://linkedin.com/company/acme")
+        self.assertEqual(results, [])
+
+    @patch("agency_finder.core._requests.get")
+    def test_returns_empty_on_non_200(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 403
+        mock_get.return_value = mock_resp
+        results = scrape_linkedin_company_page("https://linkedin.com/company/acme")
+        self.assertEqual(results, [])
+
+    @patch("agency_finder.core._requests.get")
+    def test_returns_empty_on_captcha(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = '<html><div class="captcha">Verify you are human</div></html>'
+        mock_get.return_value = mock_resp
+        results = scrape_linkedin_company_page("https://linkedin.com/company/acme")
+        self.assertEqual(results, [])
+
+    @patch("agency_finder.core._requests.get")
+    def test_parses_profile_links(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = """
+        <html>
+            <a href="/in/giorgio-bianchi">Giorgio Bianchi</a>
+            <a href="/in/laura-verdi">Laura Verdi</a>
+        </html>
+        """
+        mock_get.return_value = mock_resp
+        results = scrape_linkedin_company_page("https://linkedin.com/company/acme")
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["name"], "Giorgio Bianchi")
+        self.assertIn("/in/giorgio-bianchi", results[0]["url"])
+
+    @patch("agency_finder.core._requests.get")
+    def test_deduplicates_profiles(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = """
+        <html>
+            <a href="/in/giorgio-bianchi">Giorgio Bianchi</a>
+            <a href="https://www.linkedin.com/in/giorgio-bianchi">Giorgio</a>
+        </html>
+        """
+        mock_get.return_value = mock_resp
+        results = scrape_linkedin_company_page("https://linkedin.com/company/acme")
+        self.assertEqual(len(results), 1)
+
+    @patch("agency_finder.core._requests.get")
+    def test_caps_at_max(self, mock_get):
+        links = "".join(
+            f'<a href="/in/person-{i}">Person {i}</a>' for i in range(20)
+        )
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = f"<html>{links}</html>"
+        mock_get.return_value = mock_resp
+        results = scrape_linkedin_company_page("https://linkedin.com/company/acme", max_results=10)
+        self.assertEqual(len(results), 10)
 
 
 if __name__ == "__main__":

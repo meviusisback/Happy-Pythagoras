@@ -3,6 +3,7 @@ import time
 import logging
 import requests as _requests
 from urllib.parse import urlparse
+from bs4 import BeautifulSoup
 from typing import Dict, List, Any, Optional, Tuple
 from .search import search_query
 from .vies import check_vat
@@ -230,6 +231,89 @@ def _filter_relevant(results: List[Dict[str, str]], agency_name: str) -> List[Di
     return [r for r in results if _result_is_relevant(r, agency_name)]
 
 
+_LINKEDIN_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def scrape_linkedin_company_page(
+    linkedin_company_url: str,
+    max_results: int = 15,
+) -> List[Dict[str, str]]:
+    """Fetch a LinkedIn company page and extract employee profile links.
+
+    Returns an empty list on any failure (auth wall, CAPTCHA, network error).
+    """
+    try:
+        resp = _requests.get(
+            linkedin_company_url,
+            headers=_LINKEDIN_HEADERS,
+            timeout=10,
+            allow_redirects=True,
+        )
+    except Exception as e:
+        logger.debug(f"LinkedIn company page fetch failed ({linkedin_company_url}): {e}")
+        return []
+
+    if resp.status_code != 200:
+        logger.debug(f"LinkedIn company page returned HTTP {resp.status_code}: {linkedin_company_url}")
+        return []
+
+    html = resp.text
+    lower = html.lower()
+
+    block_signals = ["captcha", "verify you are human", "sign in", "join linkedin"]
+    if any(s in lower for s in block_signals):
+        logger.debug(f"LinkedIn company page blocked (auth/captcha): {linkedin_company_url}")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    seen: set = set()
+    contacts: List[Dict[str, str]] = []
+
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"]
+        if "/in/" not in href:
+            continue
+
+        full_url = href if href.startswith("http") else "https://www.linkedin.com" + href
+        path = urlparse(full_url).path.rstrip("/")
+        if path in seen:
+            continue
+        seen.add(path)
+
+        name_text = a_tag.get_text(strip=True)
+        if not name_text or len(name_text) < 2:
+            continue
+
+        title_text = ""
+        parent = a_tag.parent
+        if parent:
+            next_el = parent.find_next_sibling()
+            if next_el:
+                title_text = next_el.get_text(strip=True)
+            elif parent.parent:
+                siblings = parent.parent.find_all(["span", "p", "div"], limit=5)
+                for sib in siblings:
+                    t = sib.get_text(strip=True)
+                    if t and t != name_text and len(t) < 100:
+                        title_text = t
+                        break
+
+        contacts.append({
+            "name": name_text,
+            "role": title_text or "Professional",
+            "url": full_url,
+            "snippet": title_text,
+        })
+        if len(contacts) >= max_results:
+            break
+
+    return contacts
+
+
 ROLE_CLAUSE = (
     'CEO OR founder OR CTO OR direttore OR owner OR '
     '"marketing manager" OR "sales manager" OR "IT manager" OR '
@@ -251,10 +335,12 @@ def find_linkedin_employees(
     slug = linkedin_company_url.rstrip("/").split("/")[-1]
 
     queries: List[str] = [
+        f'"{slug}" site:linkedin.com/in',
+        f'site:linkedin.com/in "{slug}"',
+        f'site:linkedin.com/in "{slug}" ({ROLE_CLAUSE})',
+        f'"{query_name}" site:linkedin.com/in',
         f'site:linkedin.com/in "{query_name}" ({ROLE_CLAUSE})',
         f'site:linkedin.com/in "{query_name}"',
-        f'"{slug}" site:linkedin.com/in',
-        f'site:linkedin.com/in "{query_name}" employees',
     ]
 
     seen_urls: set = set()
@@ -477,14 +563,27 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
 
     if result["linkedin_company_url"] and query_name:
         if progress_cb:
-            progress_cb(f"Finding LinkedIn contacts anchored to company page of '{query_name}'...")
+            progress_cb(f"Anchoring contact search to LinkedIn company page: {result['linkedin_company_url']}")
         logger.info(f"LinkedIn employee search (company-page-anchored): {result['linkedin_company_url']}")
-        anchored = find_linkedin_employees(
+
+        page_contacts = scrape_linkedin_company_page(result["linkedin_company_url"])
+        for c in page_contacts:
+            c["source"] = "company_page"
+
+        search_contacts = find_linkedin_employees(
             query_name, result["linkedin_company_url"], website_domain, max_results=15
         )
-        for c in anchored:
+        for c in search_contacts:
             c["source"] = "company_page"
-        result["linkedin_contacts"] = anchored
+
+        seen_urls: set = set()
+        merged: List[Dict[str, Any]] = []
+        for c in page_contacts + search_contacts:
+            key = c["url"].rstrip("/")
+            if key not in seen_urls:
+                seen_urls.add(key)
+                merged.append(c)
+        result["linkedin_contacts"] = merged[:15]
 
     if result["linkedin_company_url"]:
         broad_contacts: List[Dict[str, Any]] = []
