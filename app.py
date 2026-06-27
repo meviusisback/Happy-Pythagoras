@@ -227,10 +227,22 @@ with tab_single:
                                 st.markdown(f"**LinkedIn Page:** [{li_name}]({li_url})")
                             st.markdown("**Key LinkedIn Contacts:**")
                             if results['linkedin_contacts']:
-                                for c in results['linkedin_contacts'][:5]:
-                                    st.markdown(f"- [{c['name']}]({c['url']}) - *{c['role']}*")
+                                for c in results['linkedin_contacts'][:8]:
+                                    src = c.get('source', '')
+                                    src_label = ' [anchored]' if src == 'company_page' else f' [{src}]' if src else ''
+                                    st.markdown(f"- [{c['name']}]({c['url']}) - *{c['role']}*{src_label}")
+                                anchored_n = sum(1 for c in results['linkedin_contacts'] if c.get('source') == 'company_page')
+                                other_n = len(results['linkedin_contacts']) - anchored_n
+                                if other_n > 0:
+                                    st.caption(f"Source: company-page anchored ({anchored_n}) + secondary sweep ({other_n})")
+                                else:
+                                    st.caption("Source: anchored to LinkedIn company page")
                             else:
-                                st.markdown("*No LinkedIn profiles found*")
+                                if results.get('linkedin_company_url'):
+                                    st.markdown("*No LinkedIn profiles matched the company page*")
+                                else:
+                                    st.markdown("*No LinkedIn company page was resolved — contacts skipped*")
+                            st.info("LinkedIn restricts indexing; results may be partial. Verify before outreach.")
                                 
                     # Row 2: Services & Payments
                     col4, col5 = st.columns(2)

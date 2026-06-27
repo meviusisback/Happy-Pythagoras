@@ -4,6 +4,7 @@ import xml.etree.ElementTree as ET
 from agency_finder.vies import check_vat
 from agency_finder.scraper import WebScraper
 from agency_finder.extractor import InformationExtractor
+from agency_finder.core import find_linkedin_employees
 
 class TestViesClient(unittest.TestCase):
     @patch("requests.post")
@@ -109,6 +110,114 @@ class TestExtractor(unittest.TestCase):
         services = self.extractor.extract_services()
         # Should include capitalized services and items found in h2/li
         self.assertTrue(any("E-Commerce" in s or "ecommerce" in s.lower() for s in services))
+
+
+class TestLinkedInEmployees(unittest.TestCase):
+
+    def _make_result(self, url, title, snippet):
+        return {"title": title, "link": url, "snippet": snippet}
+
+    @patch("agency_finder.core.search_query")
+    def test_fanout_queries(self, mock_search):
+        mock_search.return_value = []
+        find_linkedin_employees(
+            "Cantiere Creativo",
+            "https://linkedin.com/company/cantiere-creativo",
+            "canticreativo.it",
+        )
+        queries = [call.args[0] for call in mock_search.call_args_list]
+        self.assertEqual(len(queries), 4)
+        self.assertIn("Cantiere Creativo", queries[0])
+        self.assertIn("Cantiere Creativo", queries[1])
+        self.assertIn("cantiere-creativo", queries[2])
+        self.assertIn("Cantiere Creativo", queries[3])
+
+    @patch("agency_finder.core.search_query")
+    def test_dedup_by_url(self, mock_search):
+        profile_url = "https://linkedin.com/in/giorgio-bianchi"
+        r1 = self._make_result(profile_url, "Giorgio Bianchi - CEO | LinkedIn", "CEO at Cantiere Creativo")
+        r2 = self._make_result(profile_url, "Giorgio Bianchi - CEO | LinkedIn", "CEO at Cantiere Creativo")
+        mock_search.side_effect = [
+            [r1],
+            [r2],
+            [],
+            [],
+        ]
+        results = find_linkedin_employees(
+            "Cantiere Creativo",
+            "https://linkedin.com/company/cantiere-creativo",
+        )
+        urls = [c["url"] for c in results]
+        self.assertEqual(len(urls), 1)
+        self.assertEqual(urls[0], profile_url)
+
+    @patch("agency_finder.core.search_query")
+    def test_relevance_gate(self, mock_search):
+        irrelevant = self._make_result(
+            "https://linkedin.com/in/mario-rossi",
+            "Mario Rossi - Marketing | LinkedIn",
+            "Working at Totally Unrelated Corp",
+        )
+        mock_search.return_value = [irrelevant]
+        results = find_linkedin_employees(
+            "Cantiere Creativo",
+            "https://linkedin.com/company/cantiere-creativo",
+        )
+        self.assertEqual(len(results), 0)
+
+    @patch("agency_finder.core.search_query")
+    def test_relevance_by_domain_stem(self, mock_search):
+        relevant = self._make_result(
+            "https://linkedin.com/in/laura-verdi",
+            "Laura Verdi - CTO | LinkedIn",
+            "Building things at canticreativo.it since 2020",
+        )
+        mock_search.return_value = [relevant]
+        results = find_linkedin_employees(
+            "Cantiere Creativo",
+            "https://linkedin.com/company/cantiere-creativo",
+            "canticreativo.it",
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["name"], "Laura Verdi")
+        self.assertEqual(results[0]["role"], "CTO")
+
+    @patch("agency_finder.core.search_query")
+    def test_cap_at_max(self, mock_search):
+        candidates = []
+        for i in range(20):
+            candidates.append(self._make_result(
+                f"https://linkedin.com/in/person-{i}",
+                f"Person {i} - Engineer | LinkedIn",
+                f"Engineer at Cantiere Creativo",
+            ))
+        mock_search.return_value = candidates
+        results = find_linkedin_employees(
+            "Cantiere Creativo",
+            "https://linkedin.com/company/cantiere-creativo",
+            max_results=15,
+        )
+        self.assertEqual(len(results), 15)
+
+    @patch("agency_finder.core.search_query")
+    def test_exception_per_query_continues(self, mock_search):
+        good = self._make_result(
+            "https://linkedin.com/in/giorgio-bianchi",
+            "Giorgio Bianchi - CEO | LinkedIn",
+            "CEO at Cantiere Creativo",
+        )
+        mock_search.side_effect = [
+            Exception("network error"),
+            [good],
+            [],
+            [],
+        ]
+        results = find_linkedin_employees(
+            "Cantiere Creativo",
+            "https://linkedin.com/company/cantiere-creativo",
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["name"], "Giorgio Bianchi")
 
 
 if __name__ == "__main__":

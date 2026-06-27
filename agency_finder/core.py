@@ -3,7 +3,7 @@ import time
 import logging
 import requests as _requests
 from urllib.parse import urlparse
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from .search import search_query
 from .vies import check_vat
 from .scraper import WebScraper
@@ -230,6 +230,89 @@ def _filter_relevant(results: List[Dict[str, str]], agency_name: str) -> List[Di
     return [r for r in results if _result_is_relevant(r, agency_name)]
 
 
+ROLE_CLAUSE = (
+    'CEO OR founder OR CTO OR direttore OR owner OR '
+    '"marketing manager" OR "sales manager" OR "IT manager" OR '
+    'amministratore OR responsabile'
+)
+
+
+def find_linkedin_employees(
+    query_name: str,
+    linkedin_company_url: str,
+    website_domain: str = "",
+    max_results: int = 15,
+) -> List[Dict[str, str]]:
+    """Search for people connected to a LinkedIn company page.
+
+    Runs multiple targeted queries anchored to the company page and merges
+    results, deduplicating by LinkedIn profile URL.
+    """
+    slug = linkedin_company_url.rstrip("/").split("/")[-1]
+
+    queries: List[str] = [
+        f'site:linkedin.com/in "{query_name}" ({ROLE_CLAUSE})',
+        f'site:linkedin.com/in "{query_name}"',
+        f'"{slug}" site:linkedin.com/in',
+        f'site:linkedin.com/in "{query_name}" employees',
+    ]
+
+    seen_urls: set = set()
+    candidates: List[Dict[str, str]] = []
+
+    name_tokens = [w for w in query_name.lower().split() if len(w) > 2]
+    domain_stem = website_domain.lower().split(".")[0] if website_domain else ""
+
+    for q in queries:
+        time.sleep(0.5)
+        try:
+            results = search_query(q, max_results=8)
+        except Exception as e:
+            logger.warning(f"LinkedIn employee query failed ({q[:60]}…): {e}")
+            continue
+
+        for r in results:
+            link = r.get("link", "")
+            if "linkedin.com/in/" not in link.lower():
+                continue
+
+            profile_path = urlparse(link).path.rstrip("/")
+            if profile_path in seen_urls:
+                continue
+
+            title = r.get("title", "")
+            snippet = r.get("snippet", "")
+            haystack = (title + " " + snippet).lower()
+
+            name_match = any(t in haystack for t in name_tokens) if name_tokens else False
+            domain_match = domain_stem and domain_stem in haystack
+
+            if not name_match and not domain_match:
+                continue
+
+            title_clean = re.sub(r"\s*\|\s*LinkedIn", "", title, flags=re.IGNORECASE)
+            parts = [p.strip() for p in title_clean.split("-")]
+
+            name_part = parts[0] if parts else ""
+            role_part = parts[1] if len(parts) > 1 else "Professional"
+
+            if not name_part or name_part.lower().startswith("site:"):
+                continue
+
+            seen_urls.add(profile_path)
+            candidates.append({
+                "name": name_part,
+                "role": role_part,
+                "url": link,
+                "snippet": snippet,
+            })
+
+            if len(candidates) >= max_results:
+                return candidates
+
+    return candidates
+
+
 def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progress_cb=None) -> Dict[str, Any]:
     if not name and not vat:
         return {"error": "Provide at least a company name or a VAT number."}
@@ -392,23 +475,43 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
                                 break
                     break
 
-    for r in relevant:
-        link = r.get("link", "")
-        if "linkedin.com/in/" in link.lower():
-            title = r.get("title", "")
-            snippet = r.get("snippet", "")
-            title_clean = re.sub(r"\s*\|\s*LinkedIn", "", title, flags=re.IGNORECASE)
-            parts = [p.strip() for p in title_clean.split("-")]
-            if len(parts) >= 1:
-                name_part = parts[0]
-                role_part = parts[1] if len(parts) > 1 else "Professional"
-                if name_part and not name_part.lower().startswith("site:"):
-                    result["linkedin_contacts"].append({
-                        "name": name_part,
-                        "role": role_part,
-                        "url": link,
-                        "snippet": snippet
-                    })
+    if result["linkedin_company_url"] and query_name:
+        if progress_cb:
+            progress_cb(f"Finding LinkedIn contacts anchored to company page of '{query_name}'...")
+        logger.info(f"LinkedIn employee search (company-page-anchored): {result['linkedin_company_url']}")
+        anchored = find_linkedin_employees(
+            query_name, result["linkedin_company_url"], website_domain, max_results=15
+        )
+        for c in anchored:
+            c["source"] = "company_page"
+        result["linkedin_contacts"] = anchored
+
+    if result["linkedin_company_url"]:
+        broad_contacts: List[Dict[str, Any]] = []
+        for r in relevant:
+            link = r.get("link", "")
+            if "linkedin.com/in/" in link.lower():
+                title = r.get("title", "")
+                snippet = r.get("snippet", "")
+                title_clean = re.sub(r"\s*\|\s*LinkedIn", "", title, flags=re.IGNORECASE)
+                parts = [p.strip() for p in title_clean.split("-")]
+                if len(parts) >= 1:
+                    name_part = parts[0]
+                    role_part = parts[1] if len(parts) > 1 else "Professional"
+                    if name_part and not name_part.lower().startswith("site:"):
+                        broad_contacts.append({
+                            "name": name_part,
+                            "role": role_part,
+                            "url": link,
+                            "snippet": snippet,
+                            "source": "broad",
+                        })
+
+        seen_urls = {c["url"].rstrip("/") for c in result["linkedin_contacts"]}
+        for c in broad_contacts:
+            if c["url"].rstrip("/") not in seen_urls:
+                result["linkedin_contacts"].append(c)
+                seen_urls.add(c["url"].rstrip("/"))
 
     if result["linkedin_company_url"] and result["website"] and not result.get("website_suspect"):
         for r in linkedin_company_results:
@@ -452,18 +555,22 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
     if not scraped_ok and result["website"]:
         result["website"] = ""
 
-    if not result["linkedin_contacts"] and query_name:
+    if not result["linkedin_contacts"] and query_name and result["linkedin_company_url"]:
         if progress_cb:
-            progress_cb(f"Performing targeted LinkedIn contact search for '{query_name}'...")
-        logger.info(f"Targeted LinkedIn search: {query_name}")
+            progress_cb(f"Performing fallback LinkedIn contact search for '{query_name}'...")
+        logger.info(f"Targeted LinkedIn search (fallback): {query_name}")
         time.sleep(0.5)
         people_query = f'site:linkedin.com/in "{query_name}" CEO Founder CTO'
         people_results = search_query(people_query, max_results=5)
         relevant_people = _filter_relevant(people_results, query_name)
 
+        seen_urls = set()
         for r in relevant_people:
             link = r.get("link", "")
             if "linkedin.com/in/" in link.lower():
+                if link.rstrip("/") in seen_urls:
+                    continue
+                seen_urls.add(link.rstrip("/"))
                 title = r.get("title", "")
                 snippet = r.get("snippet", "")
                 title_clean = re.sub(r"\s*\|\s*LinkedIn", "", title, flags=re.IGNORECASE)
@@ -476,7 +583,8 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
                             "name": name_part,
                             "role": role_part,
                             "url": link,
-                            "snippet": snippet
+                            "snippet": snippet,
+                            "source": "fallback",
                         })
 
     return result
