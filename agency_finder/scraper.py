@@ -114,7 +114,7 @@ class WebScraper:
                     element.decompose()
 
             # Get title
-            title = soup.title.string.strip() if soup.title else ""
+            title = soup.title.get_text(strip=True) if soup.title else ""
             
             # Extract plain text content
             text = soup.get_text(separator="\n")

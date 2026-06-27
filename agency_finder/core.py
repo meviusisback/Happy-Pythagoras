@@ -1,6 +1,7 @@
 import re
 import time
 import logging
+import requests as _requests
 from urllib.parse import urlparse
 from typing import Dict, List, Any, Optional
 from .search import search_query
@@ -22,7 +23,187 @@ IGNORE_DOMAINS = {
     "europages.it", "kompass.com", "europages.com",
     "trustpilot.com", "crunchbase.com",
     "medium.com", "behance.net", "dribbble.com",
+    "sortlist.it", "sortlist.com",
+    "ecommerceitalia.info", "ecommerceitalia.it",
+    "semrush.com", "hubspot.com",
+    "yandex.com", "yandex.ru", "yandex.net",
+    "tadviser.ru", "tadviser.com",
+    "finance.rambler.ru", "lenta.ru",
+    "klerk.ru", "tumgik.com",
+    "belka.ai",
+    "belkasoft.com",
 }
+
+PARKING_SIGNALS = [
+    "plesk", "cpanel", "default website", "web server's default page",
+    "this domain is parked", "domain for sale",
+    "coming soon", "under construction",
+    "welcome to nginx", "apache2",
+    "index of /",
+    "questo dominio è in attesa",
+    "hosted by",
+]
+
+
+def _is_parking_page(html: str) -> bool:
+    lower = html.lower()[:5000]
+    signal_count = sum(1 for s in PARKING_SIGNALS if s in lower)
+    if signal_count >= 1 and len(html) < 6000:
+        return True
+    if len(html) < 800 and "default" in lower:
+        return True
+    return False
+
+
+def _score_website(url: str, agency_name: str) -> Dict[str, Any]:
+    name_lower = agency_name.lower().strip()
+    name_words = [w for w in name_lower.split() if len(w) > 2]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Accept": "text/html,*/*;q=0.9",
+    }
+
+    try:
+        resp = _requests.get(url, headers=headers, timeout=8, allow_redirects=True)
+        final_url = resp.url
+        final_domain = urlparse(final_url).netloc.lower()
+        clean_domain = final_domain[4:] if final_domain.startswith("www.") else final_domain
+
+        if "text/html" not in resp.headers.get("Content-Type", ""):
+            return {"score": -50, "url": url, "final_url": final_url, "reason": "non-html"}
+
+        html = resp.text
+        if len(html) < 500:
+            return {"score": -30, "url": url, "final_url": final_url, "reason": "too short"}
+
+        if _is_parking_page(html):
+            return {"score": -100, "url": url, "final_url": final_url, "reason": "parking page"}
+
+        title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+        title = title_match.group(1).strip() if title_match else ""
+
+        text_body = re.sub(r'<[^>]+>', ' ', html)
+        text_body = re.sub(r'\s+', ' ', text_body).strip()[:5000]
+
+        score = 0
+
+        domain_has_name = any(w in clean_domain for w in name_words)
+        all_words_in_domain = all(w in clean_domain for w in name_words) if name_words else False
+        name_combined = name_lower.replace(" ", "")
+
+        if name_combined in clean_domain:
+            score += 40
+        elif all_words_in_domain:
+            score += 35
+        elif domain_has_name:
+            if len(name_words) <= 1:
+                score += 30
+            elif sum(1 for w in name_words if w in clean_domain) >= len(name_words) - 1:
+                score += 20
+            else:
+                score += 5
+
+        if clean_domain.count(".") > 1:
+            score -= 10
+
+        if name_lower in title.lower():
+            score += 20
+        elif name_words and any(w in title.lower() for w in name_words):
+            score += 10
+
+        if name_lower in text_body.lower():
+            score += 15
+
+        industry_terms = ["web agency", "ecommerce", "agenzia", "digital", "software", "sviluppo", "consulenza", "sviluppo web"]
+        if any(t in text_body.lower() for t in industry_terms):
+            score += 10
+
+        link_count = len(re.findall(r'href="[^"]*"', html))
+        if link_count > 10:
+            score += 15
+        elif link_count > 3:
+            score += 5
+
+        if len(html) > 10000:
+            score += 10
+        elif len(html) > 3000:
+            score += 5
+
+        platform_domains = ["infobel", "yelp", "sortlist", "ecommerceitalia", "kompass", "trovaprezzi", "semrush", "alladvertising"]
+        if any(p in clean_domain for p in platform_domains):
+            score -= 40
+
+        return {"score": score, "url": url, "final_url": final_url, "reason": f"score={score}, title='{title[:30]}'"}
+    except Exception as e:
+        return {"score": -50, "url": url, "final_url": url, "reason": f"error: {e}"}
+
+
+def _collect_candidates(results: List[Dict[str, str]]) -> List[str]:
+    seen = set()
+    candidates = []
+    for r in results:
+        link = r.get("link", "")
+        parsed = urlparse(link)
+        domain = parsed.netloc.lower()
+        clean_domain = domain[4:] if domain.startswith("www.") else domain
+        is_ignored = any(clean_domain == d or clean_domain.endswith("." + d) for d in IGNORE_DOMAINS)
+        if not is_ignored and parsed.scheme in ("http", "https") and clean_domain not in seen:
+            seen.add(clean_domain)
+            candidates.append(f"{parsed.scheme}://{parsed.netloc}")
+    return candidates
+
+
+def _has_meaningful_data(result: Dict[str, Any]) -> bool:
+    return bool(result.get("emails")) or bool(result.get("telephones")) or bool(result.get("services")) or bool(result.get("extracted_address"))
+
+
+def _extract(website: str, query_name: str, result: Dict[str, Any], progress_cb=None) -> bool:
+    """Scrape and extract data from a website. Returns True if useful data was found."""
+    try:
+        logger.info(f"Crawling: {website}")
+        scraper = WebScraper(website)
+        pages = scraper.crawl(progress_cb=progress_cb)
+
+        if not pages:
+            logger.warning(f"No pages crawled from {website}")
+            return False
+
+        extractor = InformationExtractor(pages)
+
+        result["emails"] = extractor.extract_emails()
+        result["telephones"] = extractor.extract_telephones()
+        result["extracted_address"] = extractor.extract_address()
+        result["services"] = extractor.extract_services()
+        result["portfolio_sites"] = extractor.extract_client_websites()
+        result["payment_integration"] = extractor.extract_payment_integrations()
+
+        if query_name:
+            scraped_text = " ".join(p.get("text", "") for p in pages).lower()
+            name_lower = query_name.lower()
+            if name_lower not in scraped_text:
+                name_words = [w for w in name_lower.split() if len(w) > 3]
+                if name_words and not any(w in scraped_text for w in name_words):
+                    result["website_suspect"] = True
+                    logger.warning(f"Website {website} may not be related to '{query_name}'")
+
+        if not result["vat_number"] or (result["vat_number"] and not result["vies_valid"]):
+            web_vat = extractor.extract_vat()
+            if web_vat and web_vat != result.get("vat_number"):
+                result["vat_number"] = web_vat
+                logger.info(f"VAT from website: {web_vat}")
+                vies_data = check_vat(web_vat)
+                result["vies_valid"] = vies_data.get("valid", False)
+                if vies_data.get("valid"):
+                    result["official_name"] = vies_data.get("company_name")
+                    result["official_address"] = vies_data.get("address")
+                else:
+                    result["vies_error"] = vies_data.get("error")
+
+        return True
+    except Exception as e:
+        logger.error(f"Failed to scrape {website}: {e}")
+        return False
 
 
 def _result_is_relevant(result: Dict[str, str], agency_name: str) -> bool:
@@ -144,16 +325,31 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
                     result["vies_error"] = vies_data.get("error")
                     result["vat_number"] = ""
 
-    for r in relevant:
-        link = r.get("link", "")
-        parsed = urlparse(link)
-        domain = parsed.netloc.lower()
-        clean_domain = domain[4:] if domain.startswith("www.") else domain
-        is_ignored = any(clean_domain == d or clean_domain.endswith("." + d) for d in IGNORE_DOMAINS)
-        if not is_ignored and parsed.scheme in ("http", "https"):
-            result["website"] = f"{parsed.scheme}://{parsed.netloc}"
-            logger.info(f"Resolved website: {result['website']}")
-            break
+    candidates = _collect_candidates(relevant)
+    scored_candidates = []
+    if candidates and query_name:
+        if progress_cb:
+            progress_cb(f"Evaluating {len(candidates)} candidate websites...")
+        scored_candidates = [_score_website(url, query_name) for url in candidates]
+        scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+        candidate_log = [f'{s["url"]} (score={s["score"]})' for s in scored_candidates]
+        logger.info(f"Website candidates: {candidate_log}")
+        for sc in scored_candidates:
+            if sc["score"] >= 0:
+                result["website"] = sc["url"]
+                break
+
+    if not result["website"]:
+        for r in relevant:
+            link = r.get("link", "")
+            parsed = urlparse(link)
+            domain = parsed.netloc.lower()
+            clean_domain = domain[4:] if domain.startswith("www.") else domain
+            is_ignored = any(clean_domain == d or clean_domain.endswith("." + d) for d in IGNORE_DOMAINS)
+            if not is_ignored and parsed.scheme in ("http", "https"):
+                result["website"] = f"{parsed.scheme}://{parsed.netloc}"
+                logger.info(f"Fallback website (no scored candidate): {result['website']}")
+                break
 
     for r in relevant:
         link = r.get("link", "").lower()
@@ -189,54 +385,36 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
                         "snippet": snippet
                     })
 
-    if result["website"]:
-        try:
-            if progress_cb:
-                progress_cb(f"Crawling {result['website']} for contact details, services, and payment systems...")
-            logger.info(f"Crawling: {result['website']}")
-            scraper = WebScraper(result["website"])
-            pages = scraper.crawl(progress_cb=progress_cb)
+    urls_to_try = []
+    for sc in scored_candidates:
+        if sc["score"] >= -30:
+            urls_to_try.append(sc["url"])
+    if not urls_to_try and result["website"]:
+        urls_to_try.append(result["website"])
 
-            if pages:
-                if progress_cb:
-                    progress_cb("Analyzing website content...")
-                extractor = InformationExtractor(pages)
+    scraped_ok = False
+    for url in urls_to_try:
+        if progress_cb:
+            progress_cb(f"Crawling {url} for contact details, services, and payment systems...")
+        if _extract(url, query_name, result, progress_cb=progress_cb):
+            scraped_ok = True
+            if _has_meaningful_data(result) and not result.get("website_suspect"):
+                break
+            logger.info(f"Website {url} yielded limited data, trying next...")
+        result["emails"] = []
+        result["telephones"] = []
+        result["services"] = []
+        result["portfolio_sites"] = []
+        result["extracted_address"] = ""
+        result["payment_integration"] = {
+            "provides_payment_integration": False,
+            "payment_providers": [],
+            "associated_services": []
+        }
+        result["website_suspect"] = False
 
-                result["emails"] = extractor.extract_emails()
-                result["telephones"] = extractor.extract_telephones()
-                result["extracted_address"] = extractor.extract_address()
-                result["services"] = extractor.extract_services()
-                result["portfolio_sites"] = extractor.extract_client_websites()
-                result["payment_integration"] = extractor.extract_payment_integrations()
-
-                if query_name:
-                    scraped_text = " ".join(p.get("text", "") for p in pages).lower()
-                    name_lower = query_name.lower()
-                    if name_lower not in scraped_text:
-                        name_words = [w for w in name_lower.split() if len(w) > 3]
-                        if name_words and not any(w in scraped_text for w in name_words):
-                            result["website_suspect"] = True
-                            logger.warning(f"Website {result['website']} may not be related to '{query_name}'")
-                            if progress_cb:
-                                progress_cb(f"⚠️ Warning: '{query_name}' not found on the resolved website. Data may be from a different company.")
-
-                if not result["vat_number"] or (result["vat_number"] and not result["vies_valid"]):
-                    web_vat = extractor.extract_vat()
-                    if web_vat and web_vat != result.get("vat_number"):
-                        result["vat_number"] = web_vat
-                        if progress_cb:
-                            progress_cb(f"Found P.IVA {web_vat} on website. Validating with VIES...")
-                        logger.info(f"VAT from website: {web_vat}")
-                        vies_data = check_vat(web_vat)
-                        result["vies_valid"] = vies_data.get("valid", False)
-                        if vies_data.get("valid"):
-                            result["official_name"] = vies_data.get("company_name")
-                            result["official_address"] = vies_data.get("address")
-                        else:
-                            result["vies_error"] = vies_data.get("error")
-
-        except Exception as e:
-            logger.error(f"Failed to scrape website: {e}")
+    if not scraped_ok and result["website"]:
+        result["website"] = ""
 
     if not result["linkedin_contacts"] and query_name:
         if progress_cb:
