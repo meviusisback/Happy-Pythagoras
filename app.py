@@ -5,6 +5,7 @@ import io
 import time
 from agency_finder.core import lookup_agency
 from agency_finder.config import Config
+from agency_finder.search import last_search_error as _last_search_error
 
 # Configure Page
 st.set_page_config(
@@ -167,7 +168,10 @@ with tab_single:
                     st.error(results["error"])
                 else:
                     status_placeholder.success(f"✅ Intelligence report ready! (GATHERED IN {time.time() - time_start:.1f}s)")
-                    
+
+                    if _last_search_error:
+                        st.warning(f"⚠️ Search issue: {_last_search_error}")
+
                     # Display metrics/summary
                     col1, col2, col3 = st.columns(3)
                     
