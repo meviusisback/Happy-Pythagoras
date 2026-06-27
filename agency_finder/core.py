@@ -146,10 +146,10 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
         "linkedin_contacts": []
     }
 
-    # 1. VAT Validation and Retrieval
+    # 1. VAT Validation and Retrieval (if VAT was explicitly provided)
     if result["vat_number"]:
         if progress_cb:
-            progress_cb(f"Validating VAT number {result['vat_number']} via VIES...")
+            progress_cb(f"Validating provided P.IVA {result['vat_number']} via VIES...")
         logger.info(f"Validating VAT number via VIES: {result['vat_number']}")
         vies_data = check_vat(result["vat_number"])
         result["vies_valid"] = vies_data.get("valid", False)
@@ -160,43 +160,94 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
         else:
             result["vies_error"] = vies_data.get("error")
 
-    # 2. Find VAT if not provided (directory search)
-    if not result["vat_number"] and name:
+    # 2. Perform ONE general search query to collect all index data (website, VAT, LinkedIn links)
+    search_term = result["vat_number"] if (result["vat_number"] and not name) else name
+    search_results = []
+    
+    if search_term:
         if progress_cb:
-            progress_cb(f"Searching corporate registries for P.IVA of '{name}'...")
-        logger.info(f"Searching for VAT number for: {name}")
-        discovered_vat = find_vat_by_name(name)
-        if discovered_vat:
-            result["vat_number"] = discovered_vat
-            if progress_cb:
-                progress_cb(f"Discovered P.IVA: {discovered_vat}. Checking VIES registry...")
-            logger.info(f"Found VAT number: {discovered_vat}, verifying with VIES")
-            vies_data = check_vat(discovered_vat)
-            result["vies_valid"] = vies_data.get("valid", False)
-            if vies_data.get("valid"):
-                result["official_name"] = vies_data.get("company_name")
-                result["official_address"] = vies_data.get("address")
-            else:
-                result["vies_error"] = vies_data.get("error")
+            progress_cb(f"Running search queries on '{search_term}' to parse registry & index links...")
+        logger.info(f"Running search query for: {search_term}")
+        search_results = search_query(search_term, max_results=10)
 
-    # 3. Resolve Website URL
-    query_name = result["official_name"] or name
-    if progress_cb:
-        progress_cb(f"Searching for official website of '{query_name}'...")
-    logger.info(f"Resolving website URL for: {query_name}")
-    resolved_url = resolve_agency_website(query_name)
-    if resolved_url:
-        result["website"] = resolved_url
-        logger.info(f"Resolved website: {resolved_url}")
-    else:
-        # Fallback: if VAT is provided, search website by VAT
-        if result["vat_number"]:
-            if progress_cb:
-                progress_cb(f"Website not found by name. Searching by VAT {result['vat_number']}...")
-            logger.info(f"Resolving website URL by VAT: {result['vat_number']}")
-            resolved_url = resolve_agency_website(result["vat_number"])
-            if resolved_url:
-                result["website"] = resolved_url
+    # 3. Parse General Search Results
+    
+    # A. Scan search snippets for VAT number if we don't have one
+    if not result["vat_number"]:
+        vat_regex = r"\b\d{11}\b"
+        for r in search_results:
+            snippet = r.get("snippet", "") + " " + r.get("title", "")
+            matches = re.findall(vat_regex, snippet)
+            if matches:
+                discovered_vat = matches[0]
+                result["vat_number"] = discovered_vat
+                if progress_cb:
+                    progress_cb(f"Discovered P.IVA {discovered_vat} from search snippets. Validating with VIES...")
+                logger.info(f"Found VAT in search snippets: {discovered_vat}, verifying with VIES")
+                vies_data = check_vat(discovered_vat)
+                result["vies_valid"] = vies_data.get("valid", False)
+                if vies_data.get("valid"):
+                    result["official_name"] = vies_data.get("company_name")
+                    result["official_address"] = vies_data.get("address")
+                    break
+                else:
+                    result["vies_error"] = vies_data.get("error")
+
+    # B. Resolve Website URL from search links
+    ignore_domains = {
+        "linkedin.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
+        "youtube.com", "paginegialle.it", "paginebianche.it", "ufficiocamerale.it",
+        "reportaziende.it", "registroimprese.it", "tuttitalia.it", "guidamonaci.it",
+        "yelp.it", "tripadvisor.it", "glassdoor.it", "comuni-italiani.it"
+    }
+    
+    for r in search_results:
+        link = r.get("link", "")
+        parsed = urlparse(link)
+        domain = parsed.netloc.lower()
+        clean_domain = domain[4:] if domain.startswith("www.") else domain
+        
+        is_ignored = any(clean_domain == d or clean_domain.endswith("." + d) for d in ignore_domains)
+        if not is_ignored and parsed.scheme in ("http", "https"):
+            result["website"] = f"{parsed.scheme}://{parsed.netloc}"
+            logger.info(f"Resolved website URL: {result['website']}")
+            break
+
+    # C. Extract LinkedIn Company Page & Size Estimate
+    for r in search_results:
+        link = r.get("link", "").lower()
+        if "linkedin.com/company/" in link:
+            snippet = r.get("snippet", "").lower()
+            size_regexes = [
+                r"(\d+-\d+ dipendenti|\d+-\d+ employees|\d+ dipendenti|\d+ employees)",
+                r"dimensione dell.azienda:\s*([^\n,|.]+)",
+                r"company size:\s*([^\n,|.]+)"
+            ]
+            for regex in size_regexes:
+                match = re.search(regex, snippet)
+                if match:
+                    result["size_estimate"] = match.group(1).strip().capitalize()
+                    break
+            logger.info(f"Parsed company size from LinkedIn snippet: {result['size_estimate']}")
+
+    # D. Extract LinkedIn points of contact from search results
+    for r in search_results:
+        link = r.get("link", "")
+        if "linkedin.com/in/" in link:
+            title = r.get("title", "")
+            snippet = r.get("snippet", "")
+            title_clean = re.sub(r"\s*\|\s*LinkedIn", "", title, flags=re.IGNORECASE)
+            parts = [p.strip() for p in title_clean.split("-")]
+            if len(parts) >= 1:
+                name_part = parts[0]
+                role_part = parts[1] if len(parts) > 1 else "Professional"
+                if name_part and not name_part.lower().startswith("site:"):
+                    result["linkedin_contacts"].append({
+                        "name": name_part,
+                        "role": role_part,
+                        "url": link,
+                        "snippet": snippet
+                    })
 
     # 4. Scrape Website and Extract Details
     if result["website"]:
@@ -207,7 +258,7 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
             
             if pages:
                 if progress_cb:
-                    progress_cb("Analyzing text content and extracting contact cards, services, and integrations...")
+                    progress_cb("Analyzing website content for emails, services, and payment systems...")
                 extractor = InformationExtractor(pages)
                 
                 # Extract Contact Details
@@ -243,14 +294,35 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
         except Exception as e:
             logger.error(f"Failed to scrape website: {str(e)}")
 
-    # 5. LinkedIn lookup for contacts and company size
+    # 5. Targeted LinkedIn lookup (ONLY if we didn't find any contacts in the first query)
     target_linkedin_name = result["official_name"] or name
-    if target_linkedin_name:
+    if not result["linkedin_contacts"] and target_linkedin_name:
         if progress_cb:
-            progress_cb(f"Searching LinkedIn pages for points of contact and employee size...")
-        logger.info(f"Looking up LinkedIn contacts & size for: {target_linkedin_name}")
-        linkedin_data = fetch_linkedin_data(target_linkedin_name)
-        result["size_estimate"] = linkedin_data.get("size_estimate", "Unknown")
-        result["linkedin_contacts"] = linkedin_data.get("contacts", [])
+            progress_cb(f"Performing targeted LinkedIn contact search for '{target_linkedin_name}'...")
+        logger.info(f"Looking up LinkedIn contacts specifically for: {target_linkedin_name}")
+        
+        # Polite delay to prevent rate limit triggers
+        time.sleep(1.0)
+        people_query = f'site:linkedin.com/in "{target_linkedin_name}" AND ("CEO" OR "Founder" OR "CTO" OR "Owner" OR "Developer" OR "Manager" OR "Director" OR "HR")'
+        people_results = search_query(people_query, max_results=5)
+        
+        for r in people_results:
+            title = r.get("title", "")
+            link = r.get("link", "")
+            snippet = r.get("snippet", "")
+            
+            title_clean = re.sub(r"\s*\|\s*LinkedIn", "", title, flags=re.IGNORECASE)
+            parts = [p.strip() for p in title_clean.split("-")]
+            
+            if len(parts) >= 1:
+                name_part = parts[0]
+                role_part = parts[1] if len(parts) > 1 else "Professional"
+                if name_part and not name_part.lower().startswith("site:"):
+                    result["linkedin_contacts"].append({
+                        "name": name_part,
+                        "role": role_part,
+                        "url": link,
+                        "snippet": snippet
+                    })
 
     return result
