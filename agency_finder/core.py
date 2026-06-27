@@ -255,7 +255,8 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
             "associated_services": []
         },
         "portfolio_sites": [],
-        "linkedin_contacts": []
+        "linkedin_contacts": [],
+        "linkedin_company_url": ""
     }
 
     if result["vat_number"]:
@@ -286,12 +287,6 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
             logger.info(f"VAT search: {query_name}")
             query_b = f'{query_name} partita iva'
             all_results.extend(search_query(query_b, max_results=5))
-
-        if progress_cb:
-            progress_cb(f"Searching LinkedIn for '{query_name}'...")
-        logger.info(f"LinkedIn search: {query_name}")
-        query_c = f'site:linkedin.com/company {query_name}'
-        all_results.extend(search_query(query_c, max_results=8))
 
     seen_links = set()
     unique_results = []
@@ -351,21 +346,51 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
                 logger.info(f"Fallback website (no scored candidate): {result['website']}")
                 break
 
-    for r in relevant:
-        link = r.get("link", "").lower()
-        if "linkedin.com/company/" in link:
-            snippet = r.get("snippet", "").lower()
-            size_regexes = [
-                r"(\d+-\d+ dipendenti|\d+-\d+ employees|\d+ dipendenti|\d+ employees)",
-                r"dimensione dell.azienda:\s*([^\n,|.]+)",
-                r"company size:\s*([^\n,|.]+)"
-            ]
-            for regex in size_regexes:
-                match = re.search(regex, snippet)
-                if match:
-                    result["size_estimate"] = match.group(1).strip().capitalize()
+    website_domain = urlparse(result["website"]).netloc.replace("www.", "") if result["website"] else ""
+    size_regexes = [
+        r"(\d+-\d+ dipendenti|\d+-\d+ employees|\d+ dipendenti|\d+ employees)",
+        r"dimensione dell.azienda:\s*([^\n,|.]+)",
+        r"company size:\s*([^\n,|.]+)"
+    ]
+
+    linkedin_company_results = []
+    if website_domain:
+        if progress_cb:
+            progress_cb(f"Searching for LinkedIn company page of {website_domain}...")
+        li_query = f'site:linkedin.com/company "{website_domain}"'
+        linkedin_company_results = search_query(li_query, max_results=5)
+        for r in linkedin_company_results:
+            link = r.get("link", "")
+            if "linkedin.com/company/" in link.lower():
+                if _result_is_relevant(r, query_name) or _result_is_relevant(r, website_domain):
+                    result["linkedin_company_url"] = link
+                    snippet = r.get("snippet", "").lower()
+                    for regex in size_regexes:
+                        match = re.search(regex, snippet)
+                        if match:
+                            result["size_estimate"] = match.group(1).strip().capitalize()
+                            break
                     break
-            logger.info(f"Company size: {result['size_estimate']}")
+
+    if (not result["linkedin_company_url"] or result["size_estimate"] == "Unknown") and query_name:
+        if progress_cb:
+            progress_cb(f"Searching LinkedIn by name for '{query_name}'...")
+        li_query = f'site:linkedin.com/company "{query_name}"'
+        name_linkedin_results = search_query(li_query, max_results=5)
+        for r in name_linkedin_results:
+            link = r.get("link", "")
+            if "linkedin.com/company/" in link.lower():
+                if _result_is_relevant(r, query_name):
+                    if not result["linkedin_company_url"]:
+                        result["linkedin_company_url"] = link
+                    if result["size_estimate"] == "Unknown":
+                        snippet = r.get("snippet", "").lower()
+                        for regex in size_regexes:
+                            match = re.search(regex, snippet)
+                            if match:
+                                result["size_estimate"] = match.group(1).strip().capitalize()
+                                break
+                    break
 
     for r in relevant:
         link = r.get("link", "")
@@ -384,6 +409,17 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
                         "url": link,
                         "snippet": snippet
                     })
+
+    if result["linkedin_company_url"] and result["website"] and not result.get("website_suspect"):
+        for r in linkedin_company_results:
+            if r.get("link") == result["linkedin_company_url"]:
+                haystack = (r.get("title", "") + " " + r.get("snippet", "")).lower()
+                if website_domain not in haystack:
+                    first_name_word = query_name.lower().split()[0] if query_name else ""
+                    if not first_name_word or first_name_word not in haystack:
+                        logger.warning(f"LinkedIn page may not match website: {result['linkedin_company_url']}")
+                        result["website_suspect"] = True
+                break
 
     urls_to_try = []
     for sc in scored_candidates:

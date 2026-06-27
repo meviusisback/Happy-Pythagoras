@@ -221,6 +221,10 @@ with tab_single:
                         with st.container():
                             st.subheader("👥 Size & Contacts")
                             st.markdown(f"**Approx. Size (LinkedIn):** {results['size_estimate']}")
+                            if results.get('linkedin_company_url'):
+                                li_url = results['linkedin_company_url']
+                                li_name = li_url.rstrip("/").split("/")[-1].replace("-", " ").title()
+                                st.markdown(f"**LinkedIn Page:** [{li_name}]({li_url})")
                             st.markdown("**Key LinkedIn Contacts:**")
                             if results['linkedin_contacts']:
                                 for c in results['linkedin_contacts'][:5]:
