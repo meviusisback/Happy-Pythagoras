@@ -139,32 +139,64 @@ class TestAiSchemas(unittest.TestCase):
             red_flags=[],
             best_channel="linkedin",
             best_channel_reason="Active",
-            approach_tone="consultative",
+            partnership_angle="partnership",
         )
         self.assertEqual(approach.best_channel, "linkedin")
-        self.assertEqual(approach.approach_tone, "consultative")
+        self.assertEqual(approach.partnership_angle, "partnership")
 
     def test_ai_approach_invalid_channel(self):
         with self.assertRaises(ValidationError):
             AIApproach(
                 recap="r", ideal_outreach_angle="a", suggested_first_message="m",
                 talking_points=[], red_flags=[], best_channel="snailmail",
-                best_channel_reason="", approach_tone="formal",
+                best_channel_reason="", partnership_angle="partnership",
             )
 
-    def test_ai_approach_invalid_tone(self):
-        with self.assertRaises(ValidationError):
-            AIApproach(
-                recap="r", ideal_outreach_angle="a", suggested_first_message="m",
-                talking_points=[], red_flags=[], best_channel="email",
-                best_channel_reason="", approach_tone="aggressive",
-            )
+    def test_ai_approach_partnership_models_field(self):
+        approach = AIApproach(
+            recap="r", ideal_outreach_angle="a", suggested_first_message="m",
+            talking_points=[], red_flags=[], best_channel="email",
+            best_channel_reason="R", partnership_angle="partnership",
+            partnership_models=["referral", "technology_integration"],
+        )
+        self.assertEqual(len(approach.partnership_models), 2)
+        self.assertIn("referral", approach.partnership_models)
+
+    def test_ai_approach_default_partnership_angle(self):
+        approach = AIApproach(
+            recap="r", ideal_outreach_angle="a", suggested_first_message="m",
+            talking_points=[], red_flags=[], best_channel="email",
+            best_channel_reason="R",
+        )
+        self.assertEqual(approach.partnership_angle, "partnership")
 
     def test_portfolio_highlight_from_json(self):
         raw = '{"domain": "example.com", "description": "An e-commerce site"}'
         ph = PortfolioHighlight.model_validate_json(raw)
         self.assertEqual(ph.domain, "example.com")
         self.assertEqual(ph.description, "An e-commerce site")
+
+
+class TestAiPrompts(unittest.TestCase):
+
+    def test_approach_prompt_mentions_payments_and_partner(self):
+        from agency_finder.prompts import _build_approach_prompt
+        prompt = _build_approach_prompt()
+        self.assertIn("payments", prompt.lower())
+        self.assertIn("partner", prompt.lower())
+
+    def test_build_approach_prompt_substitutes_sender(self):
+        from agency_finder.prompts import _build_approach_prompt
+        prompt = _build_approach_prompt("Stripe Italia")
+        self.assertIn("Stripe Italia", prompt)
+        self.assertNotIn("an Italian payments company", prompt)
+
+    def test_build_approach_prompt_default_when_empty(self):
+        from agency_finder.prompts import _build_approach_prompt
+        prompt = _build_approach_prompt("")
+        self.assertIn("an Italian payments company", prompt)
+        prompt2 = _build_approach_prompt("   ")
+        self.assertIn("an Italian payments company", prompt2)
 
 
 class TestAiProviders(unittest.TestCase):
@@ -418,7 +450,7 @@ class TestAiPipeline(unittest.TestCase):
             red_flags=[],
             best_channel="email",
             best_channel_reason="Active on email",
-            approach_tone="consultative",
+            partnership_angle="consultative",
         )
         result = {"website": "https://example.com", "services": ["E-commerce"]}
         approach = asyncio.run(acommercial_approach(result))
@@ -435,7 +467,7 @@ class TestAiPipeline(unittest.TestCase):
         mock_approach.return_value = AIApproach(
             recap="R", ideal_outreach_angle="A", suggested_first_message="M",
             talking_points=[], red_flags=[], best_channel="email",
-            best_channel_reason="R", approach_tone="formal",
+            best_channel_reason="R", partnership_angle="formal",
         )
         result = {"website": "https://example.com"}
         updated = asyncio.run(aprocess_full(result, provider="openai", model="gpt-4o-mini"))
@@ -461,7 +493,7 @@ class TestAiPipeline(unittest.TestCase):
         mock_approach.return_value = AIApproach(
             recap="R", ideal_outreach_angle="A", suggested_first_message="M",
             talking_points=[], red_flags=[], best_channel="email",
-            best_channel_reason="R", approach_tone="formal",
+            best_channel_reason="R", partnership_angle="formal",
         )
         result = {"website": "https://example.com"}
         updated = asyncio.run(aprocess_full(result, provider="openai", model="gpt-4o-mini"))

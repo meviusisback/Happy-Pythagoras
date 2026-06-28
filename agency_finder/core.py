@@ -1246,7 +1246,7 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
                 logger.info("Starting AI post-extraction enhancement")
                 ai_provider = Config.AI_PROVIDER or None
                 ai_model = Config.AI_MODEL or None
-                result = await _full(result, provider=ai_provider, model=ai_model, timeout=45)
+                result = await _full(result, provider=ai_provider, model=ai_model, sender_company=Config.SENDER_COMPANY, timeout=45)
         except ImportError:
             logger.debug("AI layer not available for post-extraction enhancement")
         except Exception as e:

@@ -37,3 +37,5 @@ class Config:
             "Accept-Language": "en-US,en;q=0.5",
             "Referer": "https://www.google.com/",
         }
+
+    SENDER_COMPANY = os.getenv("SENDER_COMPANY", "")

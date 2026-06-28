@@ -199,6 +199,14 @@ else:
         sel_model = st.sidebar.selectbox("Model", options=models, index=default_model_idx, key="ai_model_sel")
         Config.AI_MODEL = sel_model
 
+        sender_company = st.sidebar.text_input(
+            "Your company (payments)",
+            value=Config.SENDER_COMPANY,
+            placeholder="e.g., Nexi, Satispay, Stripe Italia",
+            key="sender_company_input",
+        )
+        Config.SENDER_COMPANY = sender_company
+
         with st.sidebar.expander("🔑 Manage API Keys"):
             for p in providers:
                 info = provider_info(p)
@@ -440,13 +448,17 @@ with tab_single:
                                     st.markdown(f"**Best channel:** {ai_approach.get('best_channel', '?').title()}")
                                     st.caption(ai_approach.get('best_channel_reason', ''))
                                 with col_a2:
-                                    st.markdown(f"**Tone:** {ai_approach.get('approach_tone', '?').title()}")
+                                    st.markdown(f"**Tone:** {ai_approach.get('partnership_angle', 'partnership').title()}")
                                 with col_a3:
                                     st.markdown(f"**Angle:** {ai_approach.get('ideal_outreach_angle', '')}")
                                 if ai_approach.get('talking_points'):
                                     st.markdown("**Talking points:**")
                                     for tp in ai_approach['talking_points']:
                                         st.markdown(f"- {tp}")
+                                if ai_approach.get('partnership_models'):
+                                    st.markdown("**Partnership models:**")
+                                    for pm in ai_approach['partnership_models']:
+                                        st.markdown(f"- {pm.replace('_', ' ').title()}")
                                 if ai_approach.get('red_flags'):
                                     with st.expander("⚠️ Red flags"):
                                         for rf in ai_approach['red_flags']:
@@ -509,7 +521,7 @@ with tab_single:
 **Recap:** {ai_approach.get('recap', '')}
 
 **Best channel:** {ai_approach.get('best_channel', '?')}
-**Tone:** {ai_approach.get('approach_tone', '?')}
+**Tone:** {ai_approach.get('partnership_angle', 'partnership')}
 **Angle:** {ai_approach.get('ideal_outreach_angle', '')}
 
 **Suggested opener (Italian):**
@@ -517,6 +529,9 @@ with tab_single:
 
 **Talking points:**
 {chr(10).join(['- ' + tp for tp in ai_approach.get('talking_points', [])])}
+
+**Partnership models:**
+{chr(10).join(['- ' + pm.replace('_', ' ').title() for pm in ai_approach.get('partnership_models', [])])}
 
 **Red flags:**
 {chr(10).join(['- ' + rf for rf in ai_approach.get('red_flags', [])])}

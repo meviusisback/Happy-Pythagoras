@@ -1064,5 +1064,73 @@ class TestVatDisambiguation(unittest.TestCase):
         self.assertEqual(bonuses["https://x.com"], -10)
 
 
+class TestSearchHardening(unittest.TestCase):
+
+    def test_browser_headers_returns_required_keys(self):
+        from agency_finder.utils import _browser_headers
+        headers = _browser_headers("google")
+        required = ["User-Agent", "Accept", "Accept-Language", "Accept-Encoding",
+                     "Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform",
+                     "Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Fetch-Site",
+                     "Sec-Fetch-User", "Upgrade-Insecure-Requests", "Referer"]
+        for key in required:
+            self.assertIn(key, headers)
+
+    def test_browser_headers_referer_per_backend(self):
+        from agency_finder.utils import _browser_headers
+        self.assertIn("google", _browser_headers("google")["Referer"])
+        self.assertIn("duckduckgo", _browser_headers("ddg")["Referer"])
+        self.assertIn("bing", _browser_headers("bing")["Referer"])
+
+    def test_browser_headers_sec_ch_ua_derived(self):
+        from agency_finder.utils import _browser_headers
+        headers = _browser_headers("google")
+        self.assertIn("v=", headers["Sec-Ch-Ua"])
+        self.assertIn("Not_A Brand", headers["Sec-Ch-Ua"])
+
+    def test_browser_headers_platform_derived(self):
+        from agency_finder.utils import _browser_headers, _parse_platform
+        self.assertEqual(_parse_platform("Windows NT 10.0; Win64"), '"Windows"')
+        self.assertEqual(_parse_platform("Macintosh; Intel Mac OS X 10_15_7"), '"macOS"')
+        self.assertEqual(_parse_platform("X11; Linux x86_64"), '"Linux"')
+        self.assertEqual(_parse_platform("iPhone; CPU iPhone OS 17_6"), '"iOS"')
+        self.assertEqual(_parse_platform("Android 14; Pixel 8"), '"Android"')
+
+    def test_browser_headers_fake_ua_fallback(self):
+        from agency_finder.utils import _browser_headers, _HAS_FAKE_UA
+        from agency_finder.utils import _FALLBACK_USER_AGENTS
+        if not _HAS_FAKE_UA:
+            headers = _browser_headers("google")
+            self.assertIn(headers["User-Agent"], _FALLBACK_USER_AGENTS)
+
+    def test_browser_headers_non_empty(self):
+        from agency_finder.utils import _browser_headers
+        headers = _browser_headers("google")
+        for key, value in headers.items():
+            self.assertTrue(value, f"Header {key} is empty")
+
+    @patch("agency_finder.search._aretry")
+    def test_bing_search_uses_brdr_param(self, mock_aretry):
+        import asyncio
+        from agency_finder.search import _asearch_bing_html
+        mock_aretry.return_value = MagicMock(status_code=200, text="<html><body></body></html>")
+        asyncio.run(_asearch_bing_html("test query", 5))
+        call_args = mock_aretry.call_args
+        kwargs = call_args[1]
+        self.assertEqual(kwargs["params"].get("brdr"), 1)
+        self.assertEqual(kwargs["params"].get("setmkt"), "it-IT")
+
+    @patch("agency_finder.search._aretry")
+    def test_bing_retry_with_mobile_ua(self, mock_aretry):
+        import asyncio
+        from agency_finder.search import _asearch_bing_html
+        mock_aretry.side_effect = [
+            MagicMock(status_code=200, text="<html>captcha</html>"),
+            MagicMock(status_code=200, text="<html><li class='b_algo'><h2><a href='http://x'>Title</a></h2></li></html>"),
+        ]
+        results = asyncio.run(_asearch_bing_html("test query", 5))
+        self.assertEqual(len(results), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

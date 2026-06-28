@@ -4,7 +4,7 @@ import logging
 from typing import Optional
 
 from .ai_config import configured_providers, provider_info
-from .prompts import QUERY_OPTIMIZER_SYSTEM, REPORT_ENHANCER_SYSTEM, APPROACH_SYSTEM
+from .prompts import QUERY_OPTIMIZER_SYSTEM, REPORT_ENHANCER_SYSTEM, _build_approach_prompt
 
 try:
     from .ai_schemas import AIEnhancedReport, AIApproach, AIQueryResult
@@ -87,6 +87,7 @@ async def aenhance_report(result: dict, *,
 async def acommercial_approach(result: dict, *,
                                provider: Optional[str] = None,
                                model: Optional[str] = None,
+                               sender_company: str = "",
                                timeout: int = 60) -> Optional["AIApproach"]:
     if not _SCHEMAS_AVAILABLE or AIApproach is None:
         return None
@@ -104,7 +105,7 @@ async def acommercial_approach(result: dict, *,
             provider, model,
             messages=[{"role": "user", "content": f"Agency data:\n\n{data_str}"}],
             schema=AIApproach,
-            system=APPROACH_SYSTEM,
+            system=_build_approach_prompt(sender_company),
             timeout=timeout,
         )
         logger.info("AI commercial approach completed")
@@ -117,6 +118,7 @@ async def acommercial_approach(result: dict, *,
 async def aprocess_full(result: dict, *,
                         provider: Optional[str] = None,
                         model: Optional[str] = None,
+                        sender_company: str = "",
                         timeout: int = 60) -> dict:
     if not _SCHEMAS_AVAILABLE:
         return result
@@ -126,7 +128,7 @@ async def aprocess_full(result: dict, *,
     model = model or _best_model(provider)
 
     enhance_task = asyncio.create_task(aenhance_report(result, provider=provider, model=model))
-    approach_task = asyncio.create_task(acommercial_approach(result, provider=provider, model=model))
+    approach_task = asyncio.create_task(acommercial_approach(result, provider=provider, model=model, sender_company=sender_company))
 
     done, pending = await asyncio.wait(
         [enhance_task, approach_task],

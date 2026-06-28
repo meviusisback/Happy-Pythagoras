@@ -9,21 +9,12 @@ import re
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any, Optional, Tuple
 from .config import Config
-from .utils import USER_AGENT
+from .utils import _browser_headers
 
 logger = logging.getLogger("agency_finder.search")
 
 search_cache: Dict[str, Tuple[float, List[Dict[str, str]]]] = {}
 CACHE_TTL = 300
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-]
 
 last_search_error: Optional[str] = None
 
@@ -48,12 +39,8 @@ def _cache_set(query: str, max_results: int, results: List[Dict[str, str]]):
     search_cache[key] = (time.time(), results)
 
 
-def _rand_headers() -> Dict[str, str]:
-    return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "it,en-US;q=0.7,en;q=0.3",
-    }
+def _rand_headers(backend: str = "google") -> Dict[str, str]:
+    return _browser_headers(backend)
 
 
 async def _aretry(
@@ -70,7 +57,7 @@ async def _aretry(
 
     for attempt in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, http2=True) as client:
                 if method == "GET":
                     resp = await client.get(url, params=params, headers=headers)
                 elif method == "POST":
@@ -125,7 +112,7 @@ def _set_error(msg: str):
 
 async def _asearch_ddg_lite(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     url = "https://lite.duckduckgo.com/lite/"
-    headers = _rand_headers()
+    headers = _rand_headers("ddg")
     headers["Content-Type"] = "application/x-www-form-urlencoded"
     headers["Referer"] = "https://lite.duckduckgo.com/"
 
@@ -189,7 +176,7 @@ async def _asearch_duckduckgo(query: str, max_results: int = 10) -> List[Dict[st
 
 async def _asearch_ddg_html(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     url = "https://html.duckduckgo.com/html/"
-    headers = _rand_headers()
+    headers = _rand_headers("ddg")
     headers["Referer"] = "https://duckduckgo.com/"
 
     try:
@@ -237,36 +224,57 @@ async def _asearch_ddg_html(query: str, max_results: int = 10) -> List[Dict[str,
 
 async def _asearch_bing_html(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     url = "https://www.bing.com/search"
-    headers = _rand_headers()
-    headers["Accept-Language"] = "it-IT,it;q=0.9,en;q=0.8"
+    params = {"q": query, "count": min(max_results, 20), "brdr": 1, "setmkt": "it-IT"}
+    mobile_ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 
-    try:
-        response = await _aretry(url, params={"q": query, "count": min(max_results, 20)}, headers=headers)
-        if response is None:
-            return []
-        if response.status_code != 200:
-            logger.warning(f"Bing search returned HTTP {response.status_code}")
-            return []
-        if _is_captcha(response.text):
-            logger.warning("Bing is blocking the search request.")
-            return []
+    for attempt, ua_suffix in [(1, ""), (2, " (mobile fallback)")]:
+        headers = _rand_headers("bing")
+        if attempt == 2:
+            headers["User-Agent"] = mobile_ua
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        results = []
-        for el in soup.select("li.b_algo")[:max_results]:
-            title_link = el.select_one("h2 a")
-            if not title_link:
+        try:
+            response = await _aretry(url, params=params, headers=headers)
+            if response is None:
+                if attempt == 1:
+                    logger.warning("Bing search returned None — retrying with mobile UA")
+                    continue
+                return []
+            if response.status_code != 200:
+                if attempt == 1:
+                    logger.warning(f"Bing search returned HTTP {response.status_code} — retrying with mobile UA")
+                    continue
+                return []
+            if _is_captcha(response.text):
+                if attempt == 1:
+                    logger.warning("Bing is blocking the search request — retrying with mobile UA")
+                    continue
+                logger.warning("Bing search blocked even with mobile UA")
+                return []
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            results = []
+            for el in soup.select("li.b_algo")[:max_results]:
+                title_link = el.select_one("h2 a")
+                if not title_link:
+                    continue
+                title = title_link.get_text(strip=True)
+                link = title_link.get("href", "")
+                snippet_el = el.select_one(".b_caption p") or el.select_one("p.b_lineclamp2")
+                snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+                if title and link:
+                    results.append({"title": title, "link": link, "snippet": snippet})
+            if results:
+                return results
+            if attempt == 1:
+                logger.warning("Bing search returned empty results — retrying with mobile UA")
                 continue
-            title = title_link.get_text(strip=True)
-            link = title_link.get("href", "")
-            snippet_el = el.select_one(".b_caption p") or el.select_one("p.b_lineclamp2")
-            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-            if title and link:
-                results.append({"title": title, "link": link, "snippet": snippet})
-        return results
-    except Exception as e:
-        logger.error(f"Bing HTML scrape error: {e}")
-        return []
+            return results
+        except Exception as e:
+            if attempt == 1:
+                logger.warning(f"Bing scrape error: {e} — retrying with mobile UA")
+                continue
+            logger.error(f"Bing HTML scrape error (mobile): {e}")
+            return []
 
 
 async def _asearch_serpapi(query: str, max_results: int = 10) -> List[Dict[str, str]]:
