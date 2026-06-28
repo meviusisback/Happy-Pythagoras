@@ -100,6 +100,9 @@ async def _achat_openai(provider: str, model: str, messages: list, *,
 
     try:
         response = await client.chat.completions.create(**kwargs)
+        if isinstance(response, str):
+            logger.debug(f"{provider} returned a raw string response")
+            return response
         return response.choices[0].message.content or ""
     except Exception as e:
         status = getattr(e, "status_code", None)
@@ -198,14 +201,13 @@ async def _achat_json_openai(provider: str, model: str, messages: list, *,
             messages=msgs,
             timeout=timeout,
             response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema.__name__,
-                    "schema": schema.model_json_schema(),
-                },
+                "type": "json_object",
             },
         )
-        raw = response.choices[0].message.content or ""
+        if isinstance(response, str):
+            raw = response
+        else:
+            raw = response.choices[0].message.content or ""
         return schema.model_validate_json(raw)
     except Exception as e:
         status = getattr(e, "status_code", None)
@@ -225,12 +227,11 @@ async def alist_models(provider: str, *, timeout: int = 10) -> list[str]:
 
     info = provider_info(provider)
     family = info["sdk_family"]
+    supports_endpoint = info.get("supports_models_endpoint", True)
 
-    if family == "openai":
+    if family == "openai" and supports_endpoint:
         models = await _alist_models_openai(provider, timeout)
-    elif family == "anthropic":
-        models = list(info.get("fallback_models", []))
-    elif family == "gemini":
+    elif family == "gemini" and supports_endpoint:
         models = await _alist_models_gemini(provider, timeout)
     else:
         models = list(info.get("fallback_models", []))

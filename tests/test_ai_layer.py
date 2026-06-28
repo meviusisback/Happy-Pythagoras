@@ -244,9 +244,51 @@ class TestAiProviders(unittest.TestCase):
         self.assertTrue(len(models) > 0)
         self.assertIn("gpt-4o-mini", models)
 
+    def test_alist_models_skips_endpoint_when_flag_false(self):
+        set_api_key("opencodego", "sk-test")
+        try:
+            models = asyncio.run(alist_models("opencodego"))
+            self.assertTrue(len(models) > 0)
+            self.assertEqual(models, ["opencode/default"])
+        finally:
+            clear_api_key("opencodego")
+
     def test_achat_unknown_provider(self):
         with self.assertRaises(AIError):
             asyncio.run(achat("unknown", "model", [{"role": "user", "content": "Hi"}]))
+    
+    @patch("agency_finder.ai_providers._get_openai_client")
+    def test_achat_openai_handles_string_response(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value="raw string response")
+        mock_get_client.return_value = mock_client
+
+        result = asyncio.run(achat("openai", "gpt-4o-mini", [{"role": "user", "content": "Hi"}]))
+        self.assertEqual(result, "raw string response")
+    
+    @patch("agency_finder.ai_providers._get_openai_client")
+    def test_achat_json_openai_handles_string_response(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value='{"queries": ["q1"]}')
+        mock_get_client.return_value = mock_client
+
+        from agency_finder.ai_schemas import AIQueryResult
+        result = asyncio.run(achat_json("openai", "gpt-4o-mini", [{"role": "user", "content": "Test"}], schema=AIQueryResult))
+        self.assertEqual(result.queries, ["q1"])
+    
+    @patch("agency_finder.ai_providers._get_openai_client")
+    def test_achat_json_openai_uses_json_object_mode(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"queries": ["q1"]}'
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+        mock_get_client.return_value = mock_client
+
+        from agency_finder.ai_schemas import AIQueryResult
+        asyncio.run(achat_json("openai", "gpt-4o-mini", [{"role": "user", "content": "Test"}], schema=AIQueryResult))
+        _, call_kwargs = mock_client.chat.completions.create.call_args
+        self.assertEqual(call_kwargs["response_format"], {"type": "json_object"})
 
 
 class TestAiPipeline(unittest.TestCase):
