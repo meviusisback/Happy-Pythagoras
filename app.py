@@ -32,7 +32,7 @@ def _cached_models(provider: str) -> list[str]:
     mods = _get_ai_modules()
     if mods is None:
         return []
-    _, provider_info_fn, is_configured_fn, _, _, _, alist_models_fn = mods
+    _, provider_info_fn, is_configured_fn, _, _, alist_models_fn = mods
     if is_configured_fn(provider):
         try:
             return asyncio.run(alist_models_fn(provider))
