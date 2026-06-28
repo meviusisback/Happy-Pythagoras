@@ -292,29 +292,76 @@ async def _asearch_ddg_html(query: str, max_results: int = 10) -> List[Dict[str,
     return []
 
 
+_ITALIAN_ARTICLES = {"di", "del", "della", "dello", "dei", "degli", "delle", "e", "ed", "the", "and"}
+
+
 def _slugify_name(name: str) -> Tuple[str, str]:
     from .utils import strip_diacritics
     cleaned = strip_diacritics(name.lower())
+    no_articles = re.sub(r"\b(" + "|".join(_ITALIAN_ARTICLES) + r")\b", "", cleaned)
+    no_articles = re.sub(r"\s+", " ", no_articles).strip()
     no_space = re.sub(r"[^a-z0-9]", "", cleaned)
     hyphen = re.sub(r"[^a-z0-9]+", "-", cleaned).strip("-")
-    return no_space, hyphen
+    no_space_na = re.sub(r"[^a-z0-9]", "", no_articles)
+    hyphen_na = re.sub(r"[^a-z0-9]+", "-", no_articles).strip("-")
+    variants = {no_space, hyphen}
+    if no_space_na and no_space_na != no_space:
+        variants.add(no_space_na)
+    if hyphen_na and hyphen_na != hyphen:
+        variants.add(hyphen_na)
+    ordered = sorted(variants, key=len)
+    return ordered[0] if ordered else no_space, ordered[1] if len(ordered) > 1 else hyphen
+
+
+_SEARCH_ONLY_MODIFIERS = [
+    "web agency contatti", "web agency", "agenzia web",
+    "partita iva", "p.iva", "p. iva",
+    "linkedin", "contatti", "contatto",
+    "italia", "italy", "italian", "italiano",
+    "milano", "milan", "roma", "rome", "torino", "turin", "napoli", "naples",
+    "srl", "s.r.l", "s.r.l.", "spa", "s.p.a", "s.p.a.", "snc", "s.n.c",
+]
+
+_DOMAIN_RELEVANT_MODIFIERS = [
+    "agenzia", "studio", "digitale", "digital", "comunicazione", "marketing",
+]
 
 
 def _clean_agency_name(query: str) -> str:
-    """Strip common search modifiers from a query to get the bare agency name."""
-    modifiers = [
-        "web agency", "agenzia web", "agenzia", "studio", "partita iva", "p.iva", "p. iva",
-        "linkedin", "contatti", "contatto", "italia", "italy", "italian", "italiano",
-        "milano", "milan", "roma", "rome", "torino", "turin", "napoli", "naples",
-        "srl", "s.r.l", "s.r.l.", "spa", "s.p.a", "s.p.a.", "snc", "s.n.c",
-        "digitale", "digital", "comunicazione", "marketing",
-    ]
+    """Strip search-only modifiers to get the bare agency name (keeps domain-relevant terms)."""
     cleaned = query
-    for mod in modifiers:
+    for mod in _SEARCH_ONLY_MODIFIERS:
         cleaned = re.sub(r"(?i)\b" + re.escape(mod) + r"\b", "", cleaned)
     cleaned = re.sub(r"[^A-Za-zÀ-ÿ0-9 ]", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def _clean_agency_name_stripped(query: str) -> str:
+    """Strip ALL modifiers including domain-relevant ones (for search query use)."""
+    cleaned = query
+    for mod in _SEARCH_ONLY_MODIFIERS + _DOMAIN_RELEVANT_MODIFIERS:
+        cleaned = re.sub(r"(?i)\b" + re.escape(mod) + r"\b", "", cleaned)
+    cleaned = re.sub(r"[^A-Za-zÀ-ÿ0-9 ]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _generate_name_variants(query: str) -> List[str]:
+    """Generate multiple cleaned name variants for domain guessing.
+
+    Returns unique cleaned names, e.g. for "Studio Web Creativo Milano":
+    - "Studio Web Creativo" (keeps domain-relevant terms, strips city)
+    - "Web Creativo" (strips everything)
+    """
+    full = _clean_agency_name(query)
+    stripped = _clean_agency_name_stripped(query)
+    variants = []
+    for v in (full, stripped):
+        v = v.strip()
+        if v and len(v) >= 3 and v not in variants:
+            variants.append(v)
+    return variants or [full] if full else []
 
 
 def _extract_title(html: str) -> str:
@@ -324,32 +371,59 @@ def _extract_title(html: str) -> str:
     return ""
 
 
+def _name_appears_in_page(name_lower: str, name_words: List[str], html: str) -> bool:
+    """Check if the agency name appears in the page title or body text."""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    title = title_match.group(1).lower().strip() if title_match else ""
+    if name_lower in title:
+        return True
+    if name_words and sum(1 for w in name_words if w in title) >= max(2, len(name_words) - 1):
+        return True
+    body = re.sub(r"<[^>]+>", " ", html[:4000]).lower()
+    if name_lower in body:
+        return True
+    if name_words and sum(1 for w in name_words if w in body) >= max(2, len(name_words) - 1):
+        return True
+    return False
+
+
 async def _aguess_direct_domains(query: str, max_results: int = 10) -> List[Dict[str, str]]:
-    name = _clean_agency_name(query)
-    if len(name) < 3:
+    name_lower = query.lower().strip()
+    name_words = [w for w in name_lower.split() if len(w) > 2]
+    variants = _generate_name_variants(query)
+    if not variants:
         return []
-    no_space, hyphen = _slugify_name(name)
-    if not no_space:
-        return []
+
     tlds = ["it", "com", "eu", "net", "org", "io"]
     candidates = []
-    for tld in tlds:
-        for slug in (no_space, hyphen):
-            for prefix in ("", "www."):
-                candidates.append(f"https://{prefix}{slug}.{tld}")
-    seen = set()
+    for name in variants:
+        no_space, hyphen = _slugify_name(name)
+        if not no_space:
+            continue
+        for tld in tlds:
+            for slug in (no_space, hyphen):
+                for prefix in ("", "www."):
+                    url = f"https://{prefix}{slug}.{tld}"
+                    if url not in candidates:
+                        candidates.append(url)
+
+    results: List[Dict[str, str]] = []
+    seen: set[str] = set()
     for url in candidates:
-        if url in seen or not url:
+        if url in seen:
             continue
         seen.add(url)
         try:
             resp = await _aretry(url, method="GET", timeout=5, max_retries=0)
             if resp and resp.status_code == 200 and not _is_captcha(resp.text):
-                title = _extract_title(resp.text) or url
-                return [{"title": title, "link": url, "snippet": "Direct domain guess"}]
+                if _name_appears_in_page(name_lower, name_words, resp.text):
+                    title = _extract_title(resp.text) or url
+                    results.append({"title": title, "link": url, "snippet": "Direct domain guess"})
+                    if len(results) >= 3:
+                        return results
         except Exception:
             continue
-    return []
+    return results
 
 
 async def _asearch_bing_html(query: str, max_results: int = 10) -> List[Dict[str, str]]:
@@ -554,23 +628,31 @@ async def asearch_query(query: str, max_results: int = 10) -> List[Dict[str, str
     tasks.append(asyncio.create_task(_aguess_direct_domains(query, max_results)))
 
     try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED, timeout=15)
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=15,
+        )
     except (asyncio.TimeoutError, TimeoutError):
         for t in tasks:
             t.cancel()
-        done, pending = set(), set()
+        results = []
 
-    for task in done:
-        try:
-            result = task.result()
-            if result:
-                _cache_set(query, max_results, result)
-                return result
-        except Exception:
+    seen_links: set[str] = set()
+    merged: List[Dict[str, str]] = []
+    for result in results:
+        if isinstance(result, BaseException):
             continue
+        if not result:
+            continue
+        for r in result:
+            link = r.get("link", "")
+            if link and link not in seen_links:
+                seen_links.add(link)
+                merged.append(r)
 
-    for p in pending:
-        p.cancel()
+    if merged:
+        _cache_set(query, max_results, merged)
+        return merged
 
     _set_error("All search backends returned no results. Try again later or configure SerpAPI/Google API keys in the sidebar.")
     return []

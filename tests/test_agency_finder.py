@@ -1042,12 +1042,13 @@ class TestVatDisambiguation(unittest.TestCase):
         bonuses = asyncio.run(_avat_bonus(
             ["https://cantierecreativo.net", "https://cantierecreativo.info"],
             "01234567890",
+            "cantiere creativo",
         ))
-        self.assertEqual(bonuses["https://cantierecreativo.net"], 50)
-        self.assertEqual(bonuses["https://cantierecreativo.info"], 50)
+        self.assertEqual(bonuses["https://cantierecreativo.net"], 25)
+        self.assertEqual(bonuses["https://cantierecreativo.info"], 25)
 
     @patch("agency_finder.core.httpx.AsyncClient")
-    def test_vat_bonus_negative_when_page_missing_vat(self, MockClient):
+    def test_vat_bonus_zero_when_page_missing_vat(self, MockClient):
         import asyncio
         mock_resp = MagicMock()
         mock_resp.status_code = 200
@@ -1061,8 +1062,9 @@ class TestVatDisambiguation(unittest.TestCase):
         bonuses = asyncio.run(_avat_bonus(
             ["https://other-site.com"],
             "01234567890",
+            "cantiere creativo",
         ))
-        self.assertEqual(bonuses["https://other-site.com"], -10)
+        self.assertEqual(bonuses["https://other-site.com"], 0)
 
     def test_vat_bonus_empty_when_no_vat(self):
         import asyncio
@@ -1077,8 +1079,8 @@ class TestVatDisambiguation(unittest.TestCase):
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
         MockClient.return_value = mock_client
-        bonuses = asyncio.run(_avat_bonus(["https://x.com"], "01234567890"))
-        self.assertEqual(bonuses["https://x.com"], -10)
+        bonuses = asyncio.run(_avat_bonus(["https://x.com"], "01234567890", "acme"))
+        self.assertEqual(bonuses["https://x.com"], 0)
 
 
 class TestSearchHardening(unittest.TestCase):
@@ -1276,7 +1278,7 @@ class TestSearchRobustness(unittest.TestCase):
         from agency_finder.search import _aguess_direct_domains
         mock_aretry.return_value = MagicMock(status_code=200, text="<html><title>Acme</title></html>")
         result = asyncio.run(_aguess_direct_domains("Acme"))
-        self.assertEqual(len(result), 1)
+        self.assertGreaterEqual(len(result), 1)
         self.assertIn(".it", result[0]["link"])
 
     @patch("agency_finder.search._aretry")
@@ -1367,6 +1369,198 @@ class TestSearchRobustness(unittest.TestCase):
         self.assertTrue(any("cantierecreativo" in u for u in called_urls))
         self.assertTrue(any("cantiere-creativo" in u for u in called_urls))
         self.assertFalse(any("milano" in u.lower() for u in called_urls))
+
+    @patch("agency_finder.search._aretry")
+    def test_direct_domain_guess_generates_full_name_variants(self, mock_aretry):
+        from agency_finder.search import _aguess_direct_domains
+        mock_aretry.return_value = MagicMock(status_code=404, text="not found")
+        asyncio.run(_aguess_direct_domains("Studio Web Creativo"))
+        called_urls = [call.args[0] for call in mock_aretry.call_args_list]
+        self.assertTrue(any("studiowebcreativo" in u for u in called_urls))
+        self.assertTrue(any("webcreativo" in u for u in called_urls))
+
+    @patch("agency_finder.search._aretry")
+    def test_direct_domain_guess_rejects_irrelevant_page(self, mock_aretry):
+        from agency_finder.search import _aguess_direct_domains
+        mock_aretry.return_value = MagicMock(
+            status_code=200,
+            text="<html><title>Generic Domain Registrar</title><body>Buy this domain</body></html>"
+        )
+        result = asyncio.run(_aguess_direct_domains("Cantiere Creativo"))
+        self.assertEqual(result, [])
+
+    @patch("agency_finder.search._aretry")
+    def test_direct_domain_guess_accepts_name_in_body(self, mock_aretry):
+        from agency_finder.search import _aguess_direct_domains
+        mock_aretry.return_value = MagicMock(
+            status_code=200,
+            text="<html><title>Welcome</title><body>Cantiere Creativo is a web agency in Milan</body></html>"
+        )
+        result = asyncio.run(_aguess_direct_domains("Cantiere Creativo"))
+        self.assertGreaterEqual(len(result), 1)
+
+    def test_generate_name_variants(self):
+        from agency_finder.search import _generate_name_variants
+        variants = _generate_name_variants("Studio Web Creativo Milano")
+        self.assertTrue(any("studio web creativo" in v.lower() for v in variants))
+        self.assertTrue(any("web creativo" in v.lower() for v in variants))
+
+    def test_generate_name_variants_short_name(self):
+        from agency_finder.search import _generate_name_variants
+        variants = _generate_name_variants("Acme")
+        self.assertTrue(len(variants) >= 1)
+
+    def test_clean_agency_name_keeps_domain_terms(self):
+        from agency_finder.search import _clean_agency_name
+        self.assertEqual(_clean_agency_name("Studio Web Creativo"), "Studio Web Creativo")
+        self.assertEqual(_clean_agency_name("Agenzia Digitale"), "Agenzia Digitale")
+        self.assertEqual(_clean_agency_name("Marketing Italia srl"), "Marketing")
+
+    def test_clean_agency_name_stripped(self):
+        from agency_finder.search import _clean_agency_name_stripped
+        self.assertEqual(_clean_agency_name_stripped("Studio Web Creativo"), "Web Creativo")
+        self.assertEqual(_clean_agency_name_stripped("Agenzia Digitale"), "")
+        self.assertEqual(_clean_agency_name_stripped("Cantiere Creativo"), "Cantiere Creativo")
+
+    def test_slugify_name_removes_articles(self):
+        from agency_finder.search import _slugify_name
+        no_space, hyphen = _slugify_name("Ideas and People")
+        self.assertIn(no_space, {"ideasandpeople", "ideaspeople"})
+        self.assertTrue(any(v in {"ideas-and-people", "ideas-people"} for v in (no_space, hyphen)))
+
+    def test_name_appears_in_page(self):
+        from agency_finder.search import _name_appears_in_page
+        html = "<html><title>Cantiere Creativo - Web Agency</title><body>Welcome</body></html>"
+        self.assertTrue(_name_appears_in_page("cantiere creativo", ["cantiere", "creativo"], html))
+        self.assertFalse(_name_appears_in_page("acme agency", ["acme", "agency"], html))
+
+    def test_name_appears_in_body_only(self):
+        from agency_finder.search import _name_appears_in_page
+        html = "<html><title>Home</title><body>We are Cantiere Creativo, a digital agency</body></html>"
+        self.assertTrue(_name_appears_in_page("cantiere creativo", ["cantiere", "creativo"], html))
+
+
+class TestScoreHtmlGating(unittest.TestCase):
+
+    def _rich_html(self, title="Welcome", body="We are a web agency"):
+        links = ' '.join(f'<a href="/page{i}">link{i}</a>' for i in range(20))
+        padding = "Content about our services and portfolio. " * 50
+        return f"<html><head><title>{title}</title></head><body>{body} {padding} {links}</body></html>"
+
+    def test_score_rejected_when_name_not_in_domain_or_title(self):
+        from agency_finder.core import _score_html
+        html = self._rich_html(title="Generic Company", body="We sell widgets online")
+        result = _score_html(html, "https://generic.com", "https://generic.com", "cantiere creativo", ["cantiere", "creativo"])
+        self.assertEqual(result["score"], -10)
+
+    def test_score_positive_when_name_in_title(self):
+        from agency_finder.core import _score_html
+        html = self._rich_html(title="Cantiere Creativo - Web Agency", body="Welcome to our site")
+        result = _score_html(html, "https://generic.com", "https://generic.com", "cantiere creativo", ["cantiere", "creativo"])
+        self.assertGreater(result["score"], 0)
+
+    def test_score_positive_when_name_in_domain(self):
+        from agency_finder.core import _score_html
+        html = self._rich_html(title="Welcome", body="We build websites")
+        result = _score_html(html, "https://cantierecreativo.it", "https://cantierecreativo.it", "cantiere creativo", ["cantiere", "creativo"])
+        self.assertGreater(result["score"], 0)
+        self.assertGreaterEqual(result["score"], 50)
+
+    def test_full_name_in_domain_gets_50(self):
+        from agency_finder.core import _score_html
+        html = self._rich_html(title="Home", body="Agency content here with web agency terms")
+        result = _score_html(html, "https://cantierecreativo.it", "https://cantierecreativo.it", "cantiere creativo", ["cantiere", "creativo"])
+        self.assertGreaterEqual(result["score"], 50)
+
+    def test_generic_bonuses_reduced(self):
+        from agency_finder.core import _score_html
+        html = self._rich_html(title="Home", body="Welcome to our site. " * 100)
+        result = _score_html(html, "https://cantierecreativo.it", "https://cantierecreativo.it", "cantiere creativo", ["cantiere", "creativo"])
+        self.assertLess(result["score"], 70)
+
+
+class TestVatProximity(unittest.TestCase):
+
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_vat_bonus_requires_name_near_vat(self, MockClient):
+        import asyncio
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "text/html"}
+        padding = "x" * 1000
+        mock_resp.text = f"Cantiere Creativo S.r.l. {padding} P.IVA 01234567890"
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
+        bonuses = asyncio.run(_avat_bonus(
+            ["https://cantierecreativo.it"], "01234567890", "cantiere creativo"
+        ))
+        self.assertEqual(bonuses["https://cantierecreativo.it"], 0)
+
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_vat_bonus_granted_when_name_near_vat(self, MockClient):
+        import asyncio
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "text/html"}
+        mock_resp.text = "Cantiere Creativo S.r.l. - P.IVA 01234567890 - Milano"
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
+        bonuses = asyncio.run(_avat_bonus(
+            ["https://cantierecreativo.it"], "01234567890", "cantiere creativo"
+        ))
+        self.assertEqual(bonuses["https://cantierecreativo.it"], 25)
+
+
+class TestSearchMerging(unittest.TestCase):
+
+    @patch("agency_finder.search._asearch_duckduckgo", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_ddg_lite", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_ddg_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_mojeek", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_wikipedia", new_callable=AsyncMock)
+    @patch("agency_finder.search._aguess_direct_domains", new_callable=AsyncMock)
+    def test_asearch_query_merges_all_backends(self, mock_guess, mock_wiki, mock_bing, mock_mojeek, mock_html, mock_lite, mock_ddg):
+        from agency_finder.search import asearch_query
+        mock_ddg.return_value = [{"title": "DDG", "link": "http://ddg.com", "snippet": ""}]
+        mock_lite.return_value = [{"title": "Lite", "link": "http://lite.com", "snippet": ""}]
+        mock_html.return_value = []
+        mock_mojeek.return_value = [{"title": "Mojeek", "link": "http://mojeek.com", "snippet": ""}]
+        mock_bing.return_value = []
+        mock_wiki.return_value = []
+        mock_guess.return_value = [{"title": "Guess", "link": "http://guess.com", "snippet": ""}]
+        result = asyncio.run(asearch_query("test query", 10))
+        links = {r["link"] for r in result}
+        self.assertIn("http://ddg.com", links)
+        self.assertIn("http://lite.com", links)
+        self.assertIn("http://mojeek.com", links)
+        self.assertIn("http://guess.com", links)
+
+    @patch("agency_finder.search._asearch_duckduckgo", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_ddg_lite", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_ddg_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_mojeek", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_wikipedia", new_callable=AsyncMock)
+    @patch("agency_finder.search._aguess_direct_domains", new_callable=AsyncMock)
+    def test_asearch_query_deduplicates_links(self, mock_guess, mock_wiki, mock_bing, mock_mojeek, mock_html, mock_lite, mock_ddg):
+        from agency_finder.search import asearch_query
+        mock_ddg.return_value = [{"title": "A", "link": "http://same.com", "snippet": ""}]
+        mock_lite.return_value = [{"title": "B", "link": "http://same.com", "snippet": ""}]
+        mock_html.return_value = []
+        mock_mojeek.return_value = []
+        mock_bing.return_value = []
+        mock_wiki.return_value = []
+        mock_guess.return_value = []
+        result = asyncio.run(asearch_query("test", 10))
+        links = [r["link"] for r in result]
+        self.assertEqual(links.count("http://same.com"), 1)
 
 
 class TestPortfolioFinder(unittest.TestCase):

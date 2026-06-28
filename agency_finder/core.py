@@ -82,9 +82,18 @@ def _score_html(html: str, final_url: str, url: str, name_lower: str, name_words
     score = 0
     name_combined = name_lower.replace(" ", "")
 
-    if name_combined in clean_domain:
-        score += 40
-    elif all(w in clean_domain for w in name_words) if name_words else False:
+    name_in_domain = name_combined in clean_domain
+    all_words_in_domain = all(w in clean_domain for w in name_words) if name_words else False
+    name_in_title = name_lower in title.lower() or (
+        name_words and sum(1 for w in name_words if w in title.lower()) >= max(2, len(name_words) - 1)
+    )
+
+    if not name_in_domain and not all_words_in_domain and not name_in_title:
+        return {"score": -10, "url": url, "final_url": final_url, "reason": f"name not in domain/title, title='{title[:30]}'"}
+
+    if name_in_domain:
+        score += 50
+    elif all_words_in_domain:
         score += 35
     elif any(w in clean_domain for w in name_words):
         if len(name_words) <= 1:
@@ -107,18 +116,18 @@ def _score_html(html: str, final_url: str, url: str, name_lower: str, name_words
 
     industry_terms = ["web agency", "ecommerce", "agenzia", "digital", "software", "sviluppo", "consulenza", "sviluppo web"]
     if any(t in text_body.lower() for t in industry_terms):
-        score += 10
+        score += 5
 
     link_count = len(re.findall(r'href="[^"]*"', html))
     if link_count > 10:
-        score += 15
-    elif link_count > 3:
         score += 5
+    elif link_count > 3:
+        score += 3
 
     if len(html) > 10000:
-        score += 10
-    elif len(html) > 3000:
         score += 5
+    elif len(html) > 3000:
+        score += 3
 
     platform_domains = ["infobel", "yelp", "sortlist", "ecommerceitalia", "kompass", "trovaprezzi", "semrush", "alladvertising"]
     if any(p in clean_domain for p in platform_domains):
@@ -176,8 +185,8 @@ def _collect_candidates(results: List[Dict[str, str]]) -> List[str]:
     return candidates
 
 
-async def _acheck_vat_on_page(url: str, vat: str) -> bool:
-    """Check whether a page displays the given VAT number."""
+async def _acheck_vat_on_page(url: str, vat: str, name_lower: str = "") -> bool:
+    """Check whether a page displays the given VAT number near the agency name."""
     try:
         async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
             resp = await client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.9"})
@@ -185,17 +194,29 @@ async def _acheck_vat_on_page(url: str, vat: str) -> bool:
             return False
         if "text/html" not in resp.headers.get("Content-Type", ""):
             return False
-        return vat in resp.text
+        text = resp.text
+        if vat not in text:
+            return False
+        if not name_lower:
+            return True
+        idx = text.find(vat)
+        window = text[max(0, idx - 500):idx + len(vat) + 500].lower()
+        name_words = [w for w in name_lower.split() if len(w) > 2]
+        if name_lower in window:
+            return True
+        if name_words and sum(1 for w in name_words if w in window) >= max(2, len(name_words) - 1):
+            return True
+        return False
     except Exception:
         return False
 
 
-async def _avat_bonus(candidates: List[str], vat: str) -> Dict[str, int]:
-    """For each candidate URL, return +50 if it displays the VAT, else -10."""
+async def _avat_bonus(candidates: List[str], vat: str, name_lower: str = "") -> Dict[str, int]:
+    """For each candidate URL, return +25 if it displays the VAT near the agency name, else 0."""
     if not candidates or not vat:
         return {}
-    checks = await asyncio.gather(*[_acheck_vat_on_page(c, vat) for c in candidates])
-    return {c: (50 if found else -10) for c, found in zip(candidates, checks)}
+    checks = await asyncio.gather(*[_acheck_vat_on_page(c, vat, name_lower) for c in candidates])
+    return {c: (25 if found else 0) for c, found in zip(candidates, checks)}
 
 
 def _has_meaningful_data(result: Dict[str, Any]) -> bool:
@@ -970,9 +991,10 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
 
         if result["vat_number"] and result["vies_valid"]:
             vat = result["vat_number"]
+            name_lower_vat = (query_name or "").lower().strip()
             if progress_cb:
                 progress_cb(f"Checking which candidate website displays P.IVA {vat}...")
-            vat_bonuses = await _avat_bonus([sc["url"] for sc in scored_candidates], vat)
+            vat_bonuses = await _avat_bonus([sc["url"] for sc in scored_candidates], vat, name_lower_vat)
             for sc in scored_candidates:
                 sc["score"] += vat_bonuses.get(sc["url"], 0)
             logger.info(f"VAT {vat} bonus applied: { {k: v for k, v in vat_bonuses.items()} }")
@@ -981,7 +1003,7 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
         candidate_log = [f'{s["url"]} (score={s["score"]})' for s in scored_candidates]
         logger.info(f"Website candidates: {candidate_log}")
         for sc in scored_candidates:
-            if sc["score"] >= 0:
+            if sc["score"] >= 10:
                 result["website"] = sc["final_url"] or sc["url"]
                 break
 
@@ -996,11 +1018,12 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
             is_ignored = any(clean_domain == d or clean_domain.endswith("." + d) for d in IGNORE_DOMAINS)
             if is_ignored or parsed.scheme not in ("http", "https"):
                 continue
-            haystack = (r.get("title", "") + " " + r.get("snippet", "")).lower()
-            name_found = name_lower_fb in haystack if name_lower_fb else False
-            name_words_found = any(w in haystack for w in name_words_fb) if name_words_fb else False
-            if not name_found and not name_words_found:
-                logger.debug(f"Fallback website skipped (name not in snippet): {clean_domain}")
+            title_lower = r.get("title", "").lower()
+            name_in_domain = name_lower_fb.replace(" ", "") in clean_domain
+            name_in_title = name_lower_fb in title_lower if name_lower_fb else False
+            name_words_in_title = sum(1 for w in name_words_fb if w in title_lower) >= max(2, len(name_words_fb) - 1) if name_words_fb else False
+            if not name_in_domain and not name_in_title and not name_words_in_title:
+                logger.debug(f"Fallback website skipped (name not in domain/title): {clean_domain}")
                 continue
             result["website"] = f"{parsed.scheme}://{parsed.netloc}"
             logger.info(f"Fallback website (name-verified): {result['website']}")
@@ -1147,8 +1170,22 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
         if progress_cb:
             progress_cb(f"Crawling {url} for contact details, services, and payment systems...")
         if await _aextract(url, query_name, result, progress_cb=progress_cb):
+            if result.get("website_suspect"):
+                logger.info(f"Website {url} is suspect (name not found on site), rejecting...")
+                result["emails"] = []
+                result["telephones"] = []
+                result["services"] = []
+                result["portfolio_sites"] = []
+                result["extracted_address"] = ""
+                result["payment_integration"] = {
+                    "provides_payment_integration": False,
+                    "payment_providers": [],
+                    "associated_services": []
+                }
+                result["website_suspect"] = False
+                continue
             scraped_ok = True
-            if _has_meaningful_data(result) and not result.get("website_suspect"):
+            if _has_meaningful_data(result):
                 break
             logger.info(f"Website {url} yielded limited data, trying next...")
         result["emails"] = []
