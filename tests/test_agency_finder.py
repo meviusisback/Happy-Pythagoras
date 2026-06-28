@@ -1,18 +1,18 @@
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 import xml.etree.ElementTree as ET
-from agency_finder.vies import check_vat
+from agency_finder.vies import check_vat, acheck_vat
 from agency_finder.scraper import WebScraper
 from agency_finder.extractor import InformationExtractor
 from agency_finder.core import find_linkedin_employees, scrape_linkedin_company_page
 
+
 class TestViesClient(unittest.TestCase):
-    @patch("requests.post")
-    def test_check_vat_valid(self, mock_post):
-        # Mock VIES valid SOAP response
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.text = """
+    @patch("agency_finder.vies.httpx.AsyncClient")
+    def test_check_vat_valid(self, MockClient):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = """
         <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
           <soap:Body>
             <checkVatResponse xmlns="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
@@ -26,19 +26,22 @@ class TestViesClient(unittest.TestCase):
           </soap:Body>
         </soap:Envelope>
         """
-        mock_post.return_value = mock_response
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
 
         res = check_vat("01657380509")
         self.assertTrue(res["valid"])
         self.assertEqual(res["company_name"], "CANTIERE CREATIVO S.R.L.")
         self.assertEqual(res["address"], "VIA DE' GINORI 19 50123 FIRENZE FI")
 
-    @patch("requests.post")
-    def test_check_vat_invalid(self, mock_post):
-        # Mock VIES invalid response
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.text = """
+    @patch("agency_finder.vies.httpx.AsyncClient")
+    def test_check_vat_invalid(self, MockClient):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = """
         <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
           <soap:Body>
             <checkVatResponse xmlns="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
@@ -49,7 +52,11 @@ class TestViesClient(unittest.TestCase):
           </soap:Body>
         </soap:Envelope>
         """
-        mock_post.return_value = mock_response
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
 
         res = check_vat("00000000000")
         self.assertFalse(res["valid"])
@@ -108,7 +115,6 @@ class TestExtractor(unittest.TestCase):
 
     def test_extract_services(self):
         services = self.extractor.extract_services()
-        # Should include capitalized services and items found in h2/li
         self.assertTrue(any("E-Commerce" in s or "ecommerce" in s.lower() for s in services))
 
 
@@ -117,7 +123,7 @@ class TestLinkedInEmployees(unittest.TestCase):
     def _make_result(self, url, title, snippet):
         return {"title": title, "link": url, "snippet": snippet}
 
-    @patch("agency_finder.core.search_query")
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
     def test_fanout_queries(self, mock_search):
         mock_search.return_value = []
         find_linkedin_employees(
@@ -127,27 +133,20 @@ class TestLinkedInEmployees(unittest.TestCase):
         )
         queries = [call.args[0] for call in mock_search.call_args_list]
         self.assertEqual(len(queries), 6)
-        # First three queries should be slug-anchored
         self.assertIn("cantiere-creativo", queries[0])
         self.assertIn("cantiere-creativo", queries[1])
         self.assertIn("cantiere-creativo", queries[2])
-        # Then name-based queries
         self.assertIn("Cantiere Creativo", queries[3])
         self.assertIn("Cantiere Creativo", queries[4])
         self.assertIn("Cantiere Creativo", queries[5])
 
-    @patch("agency_finder.core.search_query")
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
     def test_dedup_by_url(self, mock_search):
         profile_url = "https://linkedin.com/in/giorgio-bianchi"
         r1 = self._make_result(profile_url, "Giorgio Bianchi - CEO | LinkedIn", "CEO at Cantiere Creativo")
         r2 = self._make_result(profile_url, "Giorgio Bianchi - CEO | LinkedIn", "CEO at Cantiere Creativo")
         mock_search.side_effect = [
-            [r1],
-            [r2],
-            [],
-            [],
-            [],
-            [],
+            [r1], [r2], [], [], [], [],
         ]
         results = find_linkedin_employees(
             "Cantiere Creativo",
@@ -157,7 +156,7 @@ class TestLinkedInEmployees(unittest.TestCase):
         self.assertEqual(len(urls), 1)
         self.assertEqual(urls[0], profile_url)
 
-    @patch("agency_finder.core.search_query")
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
     def test_relevance_gate(self, mock_search):
         irrelevant = self._make_result(
             "https://linkedin.com/in/mario-rossi",
@@ -171,7 +170,7 @@ class TestLinkedInEmployees(unittest.TestCase):
         )
         self.assertEqual(len(results), 0)
 
-    @patch("agency_finder.core.search_query")
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
     def test_relevance_by_domain_stem(self, mock_search):
         relevant = self._make_result(
             "https://linkedin.com/in/laura-verdi",
@@ -188,15 +187,16 @@ class TestLinkedInEmployees(unittest.TestCase):
         self.assertEqual(results[0]["name"], "Laura Verdi")
         self.assertEqual(results[0]["role"], "CTO")
 
-    @patch("agency_finder.core.search_query")
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
     def test_cap_at_max(self, mock_search):
-        candidates = []
-        for i in range(20):
-            candidates.append(self._make_result(
+        candidates = [
+            self._make_result(
                 f"https://linkedin.com/in/person-{i}",
                 f"Person {i} - Engineer | LinkedIn",
                 f"Engineer at Cantiere Creativo",
-            ))
+            )
+            for i in range(20)
+        ]
         mock_search.return_value = candidates
         results = find_linkedin_employees(
             "Cantiere Creativo",
@@ -205,7 +205,7 @@ class TestLinkedInEmployees(unittest.TestCase):
         )
         self.assertEqual(len(results), 15)
 
-    @patch("agency_finder.core.search_query")
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
     def test_exception_per_query_continues(self, mock_search):
         good = self._make_result(
             "https://linkedin.com/in/giorgio-bianchi",
@@ -213,12 +213,7 @@ class TestLinkedInEmployees(unittest.TestCase):
             "CEO at Cantiere Creativo",
         )
         mock_search.side_effect = [
-            Exception("network error"),
-            [good],
-            [],
-            [],
-            [],
-            [],
+            Exception("network error"), [good], [], [], [], [],
         ]
         results = find_linkedin_employees(
             "Cantiere Creativo",
@@ -230,31 +225,43 @@ class TestLinkedInEmployees(unittest.TestCase):
 
 class TestScrapeLinkedInCompanyPage(unittest.TestCase):
 
-    @patch("agency_finder.core._requests.get")
-    def test_returns_empty_on_network_error(self, mock_get):
-        mock_get.side_effect = ConnectionError("refused")
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_returns_empty_on_network_error(self, MockClient):
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=Exception("refused"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
         results = scrape_linkedin_company_page("https://linkedin.com/company/acme")
         self.assertEqual(results, [])
 
-    @patch("agency_finder.core._requests.get")
-    def test_returns_empty_on_non_200(self, mock_get):
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_returns_empty_on_non_200(self, MockClient):
         mock_resp = MagicMock()
         mock_resp.status_code = 403
-        mock_get.return_value = mock_resp
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
         results = scrape_linkedin_company_page("https://linkedin.com/company/acme")
         self.assertEqual(results, [])
 
-    @patch("agency_finder.core._requests.get")
-    def test_returns_empty_on_captcha(self, mock_get):
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_returns_empty_on_captcha(self, MockClient):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.text = '<html><div class="captcha">Verify you are human</div></html>'
-        mock_get.return_value = mock_resp
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
         results = scrape_linkedin_company_page("https://linkedin.com/company/acme")
         self.assertEqual(results, [])
 
-    @patch("agency_finder.core._requests.get")
-    def test_parses_profile_links(self, mock_get):
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_parses_profile_links(self, MockClient):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.text = """
@@ -263,14 +270,18 @@ class TestScrapeLinkedInCompanyPage(unittest.TestCase):
             <a href="/in/laura-verdi">Laura Verdi</a>
         </html>
         """
-        mock_get.return_value = mock_resp
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
         results = scrape_linkedin_company_page("https://linkedin.com/company/acme")
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0]["name"], "Giorgio Bianchi")
         self.assertIn("/in/giorgio-bianchi", results[0]["url"])
 
-    @patch("agency_finder.core._requests.get")
-    def test_deduplicates_profiles(self, mock_get):
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_deduplicates_profiles(self, MockClient):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.text = """
@@ -279,19 +290,27 @@ class TestScrapeLinkedInCompanyPage(unittest.TestCase):
             <a href="https://www.linkedin.com/in/giorgio-bianchi">Giorgio</a>
         </html>
         """
-        mock_get.return_value = mock_resp
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
         results = scrape_linkedin_company_page("https://linkedin.com/company/acme")
         self.assertEqual(len(results), 1)
 
-    @patch("agency_finder.core._requests.get")
-    def test_caps_at_max(self, mock_get):
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_caps_at_max(self, MockClient):
         links = "".join(
             f'<a href="/in/person-{i}">Person {i}</a>' for i in range(20)
         )
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.text = f"<html>{links}</html>"
-        mock_get.return_value = mock_resp
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
         results = scrape_linkedin_company_page("https://linkedin.com/company/acme", max_results=10)
         self.assertEqual(len(results), 10)
 

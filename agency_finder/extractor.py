@@ -1,6 +1,42 @@
 import re
 from urllib.parse import urlparse
 from typing import List, Dict, Set, Any
+from bs4 import BeautifulSoup
+
+_PROVIDER_PATTERN = re.compile(
+    r'\b(stripe|paypal|satispay|nexi|klarna|adyen|braintree|apple pay|google pay|amazon pay|shopify payments)\b',
+    re.IGNORECASE,
+)
+_PLATFORM_PATTERN = re.compile(
+    r'\b(shopify|woocommerce|magento|prestashop|custom e-commerce)\b',
+    re.IGNORECASE,
+)
+_PAYMENT_TERMS_PATTERN = re.compile(
+    r'\b(gateway di pagamento|sistemi di pagamento|integrazione pagamenti|pagamenti online|pos virtuale)\b',
+    re.IGNORECASE,
+)
+
+_PROVIDER_TO_NAME = {
+    "stripe": "Stripe",
+    "paypal": "PayPal",
+    "satispay": "Satispay",
+    "nexi": "Nexi / XPay",
+    "klarna": "Klarna (Buy Now Pay Later)",
+    "adyen": "Adyen",
+    "braintree": "Braintree",
+    "apple pay": "Apple Pay",
+    "google pay": "Google Pay",
+    "amazon pay": "Amazon Pay",
+    "shopify payments": "Shopify Payments",
+}
+
+_PLATFORM_TO_NAME = {
+    "shopify": "Shopify",
+    "woocommerce": "WooCommerce (WordPress)",
+    "magento": "Adobe Commerce (Magento)",
+    "prestashop": "PrestaShop",
+    "custom e-commerce": "Sviluppo E-commerce Custom",
+}
 
 class InformationExtractor:
     def __init__(self, scraped_pages: List[Dict[str, Any]]):
@@ -184,7 +220,6 @@ class InformationExtractor:
             if page.get("type") == "services":
                 # Look for list items (e.g. <li>) from BeautifulSoup
                 html = page.get("html", "")
-                from bs4 import BeautifulSoup
                 soup = BeautifulSoup(html, "html.parser")
                 
                 # Check for bullet items
@@ -217,7 +252,6 @@ class InformationExtractor:
         if not services:
             for page in self.pages:
                 if page.get("type") == "generic" or page.get("url") == page.get("base_url"):
-                    from bs4 import BeautifulSoup
                     soup = BeautifulSoup(page.get("html", ""), "html.parser")
                     for header in soup.find_all(["h2", "h3"]):
                         text = header.get_text().strip()
@@ -238,58 +272,20 @@ class InformationExtractor:
         Confirms if the agency offers payment provider integrations,
         and lists the specific providers or services mentioned.
         """
-        providers_map = {
-            "stripe": "Stripe",
-            "paypal": "PayPal",
-            "satispay": "Satispay",
-            "nexi": "Nexi / XPay",
-            "klarna": "Klarna (Buy Now Pay Later)",
-            "adyen": "Adyen",
-            "braintree": "Braintree",
-            "apple pay": "Apple Pay",
-            "google pay": "Google Pay",
-            "amazon pay": "Amazon Pay",
-            "shopify payments": "Shopify Payments"
-        }
-        
-        ecom_platforms = {
-            "shopify": "Shopify",
-            "woocommerce": "WooCommerce (WordPress)",
-            "magento": "Adobe Commerce (Magento)",
-            "prestashop": "PrestaShop",
-            "custom e-commerce": "Sviluppo E-commerce Custom"
-        }
-        
-        detected_providers = set()
-        detected_platforms = set()
-        
         text_lower = self.all_text.lower()
-        
-        # Check providers
-        for key, name in providers_map.items():
-            if key in text_lower:
-                detected_providers.add(name)
-                
-        # Check eCommerce frameworks
-        for key, name in ecom_platforms.items():
-            if key in text_lower:
-                detected_platforms.add(name)
-                
-        # Look for general payment terms
-        payment_terms = ["gateway di pagamento", "sistemi di pagamento", "integrazione pagamenti", "pagamenti online", "pos virtuale"]
-        has_general_payment_mentions = any(t in text_lower for t in payment_terms)
-        
-        # Confirm integration capability:
-        # True if we found specific providers, eCommerce platforms, or explicit payment terms
+
+        detected_providers = {_PROVIDER_TO_NAME[m.group(0).lower()] for m in _PROVIDER_PATTERN.finditer(text_lower)}
+        detected_platforms = {_PLATFORM_TO_NAME[m.group(0).lower()] for m in _PLATFORM_PATTERN.finditer(text_lower)}
+        has_general_payment_mentions = bool(_PAYMENT_TERMS_PATTERN.search(text_lower))
+
         provides_integration = len(detected_providers) > 0 or len(detected_platforms) > 0 or has_general_payment_mentions
-        
-        # Build description of services
+
         services_affected = list(detected_platforms)
         if provides_integration and not services_affected:
             services_affected = ["E-commerce / Web Development"]
-            
+
         return {
             "provides_payment_integration": provides_integration,
             "payment_providers": sorted(list(detected_providers)),
-            "associated_services": sorted(services_affected)
+            "associated_services": sorted(services_affected),
         }

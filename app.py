@@ -3,7 +3,8 @@ import pandas as pd
 import json
 import io
 import time
-from agency_finder.core import lookup_agency
+import asyncio
+from agency_finder.core import lookup_agency, alookup_agency
 from agency_finder.config import Config
 from agency_finder.search import last_search_error as _last_search_error
 
@@ -378,28 +379,27 @@ with tab_bulk:
                 bulk_results = []
                 total_rows = len(df)
                 
-                time_bulk_start = time.time()
-                for idx, row in df.iterrows():
+                semaphore = asyncio.Semaphore(5)
+                completed_count = 0
+
+                async def _process_row(idx, row):
+                    nonlocal completed_count
                     name_val = str(row["name"]).strip() if "name" in cols and pd.notna(row["name"]) else None
                     vat_val = str(row["vat"]).strip() if "vat" in cols and pd.notna(row["vat"]) else None
-                    
-                    def update_bulk_progress(msg):
-                        status_text.info(f"⚙️ Processing row {idx + 1}/{total_rows} (**{name_val or vat_val}**): {msg}")
-                    
-                    try:
-                        res = lookup_agency(name=name_val, vat=vat_val, progress_cb=update_bulk_progress)
-                        bulk_results.append(res)
-                    except Exception as e:
-                        bulk_results.append({
-                            "search_name": name_val,
-                            "search_vat": vat_val,
-                            "error": str(e)
-                        })
-                    
-                    # Update progress
-                    progress_bar.progress((idx + 1) / total_rows)
-                    time.sleep(0.5)  # Polite delay
-                    
+                    async with semaphore:
+                        def update_bulk_progress(msg):
+                            status_text.info(f"⚙️ Processing row {idx + 1}/{total_rows} (**{name_val or vat_val}**): {msg}")
+                        try:
+                            res = await alookup_agency(name=name_val, vat=vat_val, progress_cb=update_bulk_progress)
+                        except Exception as e:
+                            res = {"search_name": name_val, "search_vat": vat_val, "error": str(e)}
+                        completed_count += 1
+                        progress_bar.progress(completed_count / total_rows)
+                        return res
+
+                time_bulk_start = time.time()
+                tasks = [_process_row(idx, row) for idx, row in df.iterrows()]
+                bulk_results = asyncio.run(asyncio.gather(*tasks))
                 status_text.success(f"✅ Processed {total_rows} agencies in {time.time() - time_bulk_start:.1f} seconds!")
                 
                 # Format bulk results for tabular presentation

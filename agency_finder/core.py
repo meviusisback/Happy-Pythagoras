@@ -1,14 +1,15 @@
 import re
-import time
+import asyncio
 import logging
-import requests as _requests
+import httpx
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from typing import Dict, List, Any, Optional, Tuple
-from .search import search_query
-from .vies import check_vat
+from .search import asearch_query
+from .vies import acheck_vat
 from .scraper import WebScraper
 from .extractor import InformationExtractor
+from .utils import make_async_client, USER_AGENT
 
 logger = logging.getLogger("agency_finder.core")
 
@@ -56,86 +57,100 @@ def _is_parking_page(html: str) -> bool:
     return False
 
 
-def _score_website(url: str, agency_name: str) -> Dict[str, Any]:
+def _score_html(html: str, final_url: str, url: str, name_lower: str, name_words: List[str]) -> Dict[str, Any]:
+    final_domain = urlparse(final_url).netloc.lower()
+    clean_domain = final_domain[4:] if final_domain.startswith("www.") else final_domain
+
+    if len(html) < 500:
+        return {"score": -30, "url": url, "final_url": final_url, "reason": "too short"}
+
+    if _is_parking_page(html):
+        return {"score": -100, "url": url, "final_url": final_url, "reason": "parking page"}
+
+    title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+    title = title_match.group(1).strip() if title_match else ""
+
+    text_body = re.sub(r'<[^>]+>', ' ', html)
+    text_body = re.sub(r'\s+', ' ', text_body).strip()[:5000]
+
+    score = 0
+    name_combined = name_lower.replace(" ", "")
+
+    if name_combined in clean_domain:
+        score += 40
+    elif all(w in clean_domain for w in name_words) if name_words else False:
+        score += 35
+    elif any(w in clean_domain for w in name_words):
+        if len(name_words) <= 1:
+            score += 30
+        elif sum(1 for w in name_words if w in clean_domain) >= len(name_words) - 1:
+            score += 20
+        else:
+            score += 5
+
+    if clean_domain.count(".") > 1:
+        score -= 10
+
+    if name_lower in title.lower():
+        score += 20
+    elif name_words and any(w in title.lower() for w in name_words):
+        score += 10
+
+    if name_lower in text_body.lower():
+        score += 15
+
+    industry_terms = ["web agency", "ecommerce", "agenzia", "digital", "software", "sviluppo", "consulenza", "sviluppo web"]
+    if any(t in text_body.lower() for t in industry_terms):
+        score += 10
+
+    link_count = len(re.findall(r'href="[^"]*"', html))
+    if link_count > 10:
+        score += 15
+    elif link_count > 3:
+        score += 5
+
+    if len(html) > 10000:
+        score += 10
+    elif len(html) > 3000:
+        score += 5
+
+    platform_domains = ["infobel", "yelp", "sortlist", "ecommerceitalia", "kompass", "trovaprezzi", "semrush", "alladvertising"]
+    if any(p in clean_domain for p in platform_domains):
+        score -= 40
+
+    return {"score": score, "url": url, "final_url": final_url, "reason": f"score={score}, title='{title[:30]}'"}
+
+
+async def _ascore_website(url: str, agency_name: str) -> Dict[str, Any]:
     name_lower = agency_name.lower().strip()
     name_words = [w for w in name_lower.split() if len(w) > 2]
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "text/html,*/*;q=0.9",
-    }
-
     try:
-        resp = _requests.get(url, headers=headers, timeout=8, allow_redirects=True)
-        final_url = resp.url
-        final_domain = urlparse(final_url).netloc.lower()
-        clean_domain = final_domain[4:] if final_domain.startswith("www.") else final_domain
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.9"})
+        final_url = str(resp.url)
 
         if "text/html" not in resp.headers.get("Content-Type", ""):
             return {"score": -50, "url": url, "final_url": final_url, "reason": "non-html"}
 
-        html = resp.text
-        if len(html) < 500:
-            return {"score": -30, "url": url, "final_url": final_url, "reason": "too short"}
+        return _score_html(resp.text, final_url, url, name_lower, name_words)
+    except Exception as e:
+        return {"score": -50, "url": url, "final_url": url, "reason": f"error: {e}"}
 
-        if _is_parking_page(html):
-            return {"score": -100, "url": url, "final_url": final_url, "reason": "parking page"}
 
-        title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
-        title = title_match.group(1).strip() if title_match else ""
+def _score_website(url: str, agency_name: str) -> Dict[str, Any]:
+    name_lower = agency_name.lower().strip()
+    name_words = [w for w in name_lower.split() if len(w) > 2]
 
-        text_body = re.sub(r'<[^>]+>', ' ', html)
-        text_body = re.sub(r'\s+', ' ', text_body).strip()[:5000]
+    try:
+        with httpx.Client(timeout=8, follow_redirects=True) as client:
+            resp = client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.9"})
+        final_url = str(resp.url)
 
-        score = 0
+        if "text/html" not in resp.headers.get("Content-Type", ""):
+            return {"score": -50, "url": url, "final_url": final_url, "reason": "non-html"}
 
-        domain_has_name = any(w in clean_domain for w in name_words)
-        all_words_in_domain = all(w in clean_domain for w in name_words) if name_words else False
-        name_combined = name_lower.replace(" ", "")
-
-        if name_combined in clean_domain:
-            score += 40
-        elif all_words_in_domain:
-            score += 35
-        elif domain_has_name:
-            if len(name_words) <= 1:
-                score += 30
-            elif sum(1 for w in name_words if w in clean_domain) >= len(name_words) - 1:
-                score += 20
-            else:
-                score += 5
-
-        if clean_domain.count(".") > 1:
-            score -= 10
-
-        if name_lower in title.lower():
-            score += 20
-        elif name_words and any(w in title.lower() for w in name_words):
-            score += 10
-
-        if name_lower in text_body.lower():
-            score += 15
-
-        industry_terms = ["web agency", "ecommerce", "agenzia", "digital", "software", "sviluppo", "consulenza", "sviluppo web"]
-        if any(t in text_body.lower() for t in industry_terms):
-            score += 10
-
-        link_count = len(re.findall(r'href="[^"]*"', html))
-        if link_count > 10:
-            score += 15
-        elif link_count > 3:
-            score += 5
-
-        if len(html) > 10000:
-            score += 10
-        elif len(html) > 3000:
-            score += 5
-
-        platform_domains = ["infobel", "yelp", "sortlist", "ecommerceitalia", "kompass", "trovaprezzi", "semrush", "alladvertising"]
-        if any(p in clean_domain for p in platform_domains):
-            score -= 40
-
-        return {"score": score, "url": url, "final_url": final_url, "reason": f"score={score}, title='{title[:30]}'"}
+        return _score_html(resp.text, final_url, url, name_lower, name_words)
     except Exception as e:
         return {"score": -50, "url": url, "final_url": url, "reason": f"error: {e}"}
 
@@ -159,19 +174,17 @@ def _has_meaningful_data(result: Dict[str, Any]) -> bool:
     return bool(result.get("emails")) or bool(result.get("telephones")) or bool(result.get("services")) or bool(result.get("extracted_address"))
 
 
-def _extract(website: str, query_name: str, result: Dict[str, Any], progress_cb=None) -> bool:
-    """Scrape and extract data from a website. Returns True if useful data was found."""
+async def _aextract(website: str, query_name: str, result: Dict[str, Any], progress_cb=None) -> bool:
     try:
         logger.info(f"Crawling: {website}")
         scraper = WebScraper(website)
-        pages = scraper.crawl(progress_cb=progress_cb)
+        pages = await scraper.acrawl(progress_cb=progress_cb)
 
         if not pages:
             logger.warning(f"No pages crawled from {website}")
             return False
 
         extractor = InformationExtractor(pages)
-
         result["emails"] = extractor.extract_emails()
         result["telephones"] = extractor.extract_telephones()
         result["extracted_address"] = extractor.extract_address()
@@ -193,7 +206,7 @@ def _extract(website: str, query_name: str, result: Dict[str, Any], progress_cb=
             if web_vat and web_vat != result.get("vat_number"):
                 result["vat_number"] = web_vat
                 logger.info(f"VAT from website: {web_vat}")
-                vies_data = check_vat(web_vat)
+                vies_data = await acheck_vat(web_vat)
                 result["vies_valid"] = vies_data.get("valid", False)
                 if vies_data.get("valid"):
                     result["official_name"] = vies_data.get("company_name")
@@ -232,27 +245,19 @@ def _filter_relevant(results: List[Dict[str, str]], agency_name: str) -> List[Di
 
 
 _LINKEDIN_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
 
-def scrape_linkedin_company_page(
+async def ascrape_linkedin_company_page(
     linkedin_company_url: str,
     max_results: int = 15,
 ) -> List[Dict[str, str]]:
-    """Fetch a LinkedIn company page and extract employee profile links.
-
-    Returns an empty list on any failure (auth wall, CAPTCHA, network error).
-    """
     try:
-        resp = _requests.get(
-            linkedin_company_url,
-            headers=_LINKEDIN_HEADERS,
-            timeout=10,
-            allow_redirects=True,
-        )
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(linkedin_company_url, headers=_LINKEDIN_HEADERS)
     except Exception as e:
         logger.debug(f"LinkedIn company page fetch failed ({linkedin_company_url}): {e}")
         return []
@@ -263,7 +268,6 @@ def scrape_linkedin_company_page(
 
     html = resp.text
     lower = html.lower()
-
     block_signals = ["captcha", "verify you are human", "sign in", "join linkedin"]
     if any(s in lower for s in block_signals):
         logger.debug(f"LinkedIn company page blocked (auth/captcha): {linkedin_company_url}")
@@ -277,17 +281,14 @@ def scrape_linkedin_company_page(
         href = a_tag["href"]
         if "/in/" not in href:
             continue
-
         full_url = href if href.startswith("http") else "https://www.linkedin.com" + href
         path = urlparse(full_url).path.rstrip("/")
         if path in seen:
             continue
         seen.add(path)
-
         name_text = a_tag.get_text(strip=True)
         if not name_text or len(name_text) < 2:
             continue
-
         title_text = ""
         parent = a_tag.parent
         if parent:
@@ -301,7 +302,6 @@ def scrape_linkedin_company_page(
                     if t and t != name_text and len(t) < 100:
                         title_text = t
                         break
-
         contacts.append({
             "name": name_text,
             "role": title_text or "Professional",
@@ -310,8 +310,14 @@ def scrape_linkedin_company_page(
         })
         if len(contacts) >= max_results:
             break
-
     return contacts
+
+
+def scrape_linkedin_company_page(
+    linkedin_company_url: str,
+    max_results: int = 15,
+) -> List[Dict[str, str]]:
+    return asyncio.run(ascrape_linkedin_company_page(linkedin_company_url, max_results))
 
 
 ROLE_CLAUSE = (
@@ -321,19 +327,13 @@ ROLE_CLAUSE = (
 )
 
 
-def find_linkedin_employees(
+async def afind_linkedin_employees(
     query_name: str,
     linkedin_company_url: str,
     website_domain: str = "",
     max_results: int = 15,
 ) -> List[Dict[str, str]]:
-    """Search for people connected to a LinkedIn company page.
-
-    Runs multiple targeted queries anchored to the company page and merges
-    results, deduplicating by LinkedIn profile URL.
-    """
     slug = linkedin_company_url.rstrip("/").split("/")[-1]
-
     queries: List[str] = [
         f'"{slug}" site:linkedin.com/in',
         f'site:linkedin.com/in "{slug}"',
@@ -345,14 +345,12 @@ def find_linkedin_employees(
 
     seen_urls: set = set()
     candidates: List[Dict[str, str]] = []
-
     name_tokens = [w for w in query_name.lower().split() if len(w) > 2]
     domain_stem = website_domain.lower().split(".")[0] if website_domain else ""
 
     for q in queries:
-        time.sleep(0.5)
         try:
-            results = search_query(q, max_results=8)
+            results = await asearch_query(q, max_results=8)
         except Exception as e:
             logger.warning(f"LinkedIn employee query failed ({q[:60]}…): {e}")
             continue
@@ -361,30 +359,22 @@ def find_linkedin_employees(
             link = r.get("link", "")
             if "linkedin.com/in/" not in link.lower():
                 continue
-
             profile_path = urlparse(link).path.rstrip("/")
             if profile_path in seen_urls:
                 continue
-
             title = r.get("title", "")
             snippet = r.get("snippet", "")
             haystack = (title + " " + snippet).lower()
-
             name_match = any(t in haystack for t in name_tokens) if name_tokens else False
             domain_match = domain_stem and domain_stem in haystack
-
             if not name_match and not domain_match:
                 continue
-
             title_clean = re.sub(r"\s*\|\s*LinkedIn", "", title, flags=re.IGNORECASE)
             parts = [p.strip() for p in title_clean.split("-")]
-
             name_part = parts[0] if parts else ""
             role_part = parts[1] if len(parts) > 1 else "Professional"
-
             if not name_part or name_part.lower().startswith("site:"):
                 continue
-
             seen_urls.add(profile_path)
             candidates.append({
                 "name": name_part,
@@ -392,14 +382,21 @@ def find_linkedin_employees(
                 "url": link,
                 "snippet": snippet,
             })
-
             if len(candidates) >= max_results:
                 return candidates
-
     return candidates
 
 
-def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progress_cb=None) -> Dict[str, Any]:
+def find_linkedin_employees(
+    query_name: str,
+    linkedin_company_url: str,
+    website_domain: str = "",
+    max_results: int = 15,
+) -> List[Dict[str, str]]:
+    return asyncio.run(afind_linkedin_employees(query_name, linkedin_company_url, website_domain, max_results))
+
+
+async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progress_cb=None) -> Dict[str, Any]:
     if not name and not vat:
         return {"error": "Provide at least a company name or a VAT number."}
 
@@ -432,7 +429,7 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
         if progress_cb:
             progress_cb(f"Validating provided P.IVA {result['vat_number']} via VIES...")
         logger.info(f"Validating VAT via VIES: {result['vat_number']}")
-        vies_data = check_vat(result["vat_number"])
+        vies_data = await acheck_vat(result["vat_number"])
         result["vies_valid"] = vies_data.get("valid", False)
         if vies_data.get("valid"):
             result["official_name"] = vies_data.get("company_name")
@@ -448,14 +445,14 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
             progress_cb(f"Searching for official website of '{query_name}'...")
         logger.info(f"Website search: {query_name}")
         query_a = f'{query_name} web agency contatti'
-        all_results.extend(search_query(query_a, max_results=8))
+        all_results.extend(await asearch_query(query_a, max_results=8))
 
         if not result["vat_number"]:
             if progress_cb:
                 progress_cb(f"Searching corporate registries for P.IVA of '{query_name}'...")
             logger.info(f"VAT search: {query_name}")
             query_b = f'{query_name} partita iva'
-            all_results.extend(search_query(query_b, max_results=5))
+            all_results.extend(await asearch_query(query_b, max_results=5))
 
     seen_links = set()
     unique_results = []
@@ -479,7 +476,7 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
                 if progress_cb:
                     progress_cb(f"Discovered P.IVA {discovered_vat} from search. Validating with VIES...")
                 logger.info(f"Found VAT in search: {discovered_vat}")
-                vies_data = check_vat(discovered_vat)
+                vies_data = await acheck_vat(discovered_vat)
                 result["vies_valid"] = vies_data.get("valid", False)
                 if vies_data.get("valid"):
                     result["official_name"] = vies_data.get("company_name")
@@ -494,7 +491,7 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
     if candidates and query_name:
         if progress_cb:
             progress_cb(f"Evaluating {len(candidates)} candidate websites...")
-        scored_candidates = [_score_website(url, query_name) for url in candidates]
+        scored_candidates = list(await asyncio.gather(*[_ascore_website(url, query_name) for url in candidates]))
         scored_candidates.sort(key=lambda x: x["score"], reverse=True)
         candidate_log = [f'{s["url"]} (score={s["score"]})' for s in scored_candidates]
         logger.info(f"Website candidates: {candidate_log}")
@@ -527,7 +524,7 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
         if progress_cb:
             progress_cb(f"Searching for LinkedIn company page of {website_domain}...")
         li_query = f'site:linkedin.com/company "{website_domain}"'
-        linkedin_company_results = search_query(li_query, max_results=5)
+        linkedin_company_results = await asearch_query(li_query, max_results=5)
         for r in linkedin_company_results:
             link = r.get("link", "")
             if "linkedin.com/company/" in link.lower():
@@ -545,7 +542,7 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
         if progress_cb:
             progress_cb(f"Searching LinkedIn by name for '{query_name}'...")
         li_query = f'site:linkedin.com/company "{query_name}"'
-        name_linkedin_results = search_query(li_query, max_results=5)
+        name_linkedin_results = await asearch_query(li_query, max_results=5)
         for r in name_linkedin_results:
             link = r.get("link", "")
             if "linkedin.com/company/" in link.lower():
@@ -566,11 +563,11 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
             progress_cb(f"Anchoring contact search to LinkedIn company page: {result['linkedin_company_url']}")
         logger.info(f"LinkedIn employee search (company-page-anchored): {result['linkedin_company_url']}")
 
-        page_contacts = scrape_linkedin_company_page(result["linkedin_company_url"])
+        page_contacts = await ascrape_linkedin_company_page(result["linkedin_company_url"])
         for c in page_contacts:
             c["source"] = "company_page"
 
-        search_contacts = find_linkedin_employees(
+        search_contacts = await afind_linkedin_employees(
             query_name, result["linkedin_company_url"], website_domain, max_results=15
         )
         for c in search_contacts:
@@ -605,7 +602,6 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
                             "snippet": snippet,
                             "source": "broad",
                         })
-
         seen_urls = {c["url"].rstrip("/") for c in result["linkedin_contacts"]}
         for c in broad_contacts:
             if c["url"].rstrip("/") not in seen_urls:
@@ -634,7 +630,7 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
     for url in urls_to_try:
         if progress_cb:
             progress_cb(f"Crawling {url} for contact details, services, and payment systems...")
-        if _extract(url, query_name, result, progress_cb=progress_cb):
+        if await _aextract(url, query_name, result, progress_cb=progress_cb):
             scraped_ok = True
             if _has_meaningful_data(result) and not result.get("website_suspect"):
                 break
@@ -658,9 +654,8 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
         if progress_cb:
             progress_cb(f"Performing fallback LinkedIn contact search for '{query_name}'...")
         logger.info(f"Targeted LinkedIn search (fallback): {query_name}")
-        time.sleep(0.5)
         people_query = f'site:linkedin.com/in "{query_name}" CEO Founder CTO'
-        people_results = search_query(people_query, max_results=5)
+        people_results = await asearch_query(people_query, max_results=5)
         relevant_people = _filter_relevant(people_results, query_name)
 
         seen_urls = set()
@@ -687,3 +682,7 @@ def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progres
                         })
 
     return result
+
+
+def lookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progress_cb=None) -> Dict[str, Any]:
+    return asyncio.run(alookup_agency(name=name, vat=vat, progress_cb=progress_cb))

@@ -1,4 +1,5 @@
-import requests
+import asyncio
+import httpx
 import time
 import logging
 import urllib.parse
@@ -8,6 +9,7 @@ import re
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any, Optional, Tuple
 from .config import Config
+from .utils import USER_AGENT
 
 logger = logging.getLogger("agency_finder.search")
 
@@ -54,45 +56,47 @@ def _rand_headers() -> Dict[str, str]:
     }
 
 
-def _retry(
+async def _aretry(
     url: str,
     method: str = "GET",
     *,
     params: Optional[Dict] = None,
+    data: Optional[Dict] = None,
     headers: Optional[Dict] = None,
     timeout: Optional[int] = None,
-) -> Optional[requests.Response]:
+) -> Optional[httpx.Response]:
     max_retries = 3
     timeout = timeout or Config.TIMEOUT
 
     for attempt in range(max_retries + 1):
         try:
-            if method == "GET":
-                resp = requests.get(url, params=params, headers=headers, timeout=timeout)
-            elif method == "POST":
-                resp = requests.post(url, data=params, headers=headers, timeout=timeout)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                if method == "GET":
+                    resp = await client.get(url, params=params, headers=headers)
+                elif method == "POST":
+                    resp = await client.post(url, data=data, headers=headers)
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
 
             if resp.status_code == 429:
                 wait = (2 ** attempt) * 2
                 logger.warning(f"Rate limited (429) on {url}. Retry {attempt+1}/{max_retries} in {wait}s")
-                time.sleep(wait)
+                await asyncio.sleep(wait)
                 continue
 
             if resp.status_code >= 500 and attempt < max_retries:
                 wait = (2 ** attempt) * 2
                 logger.warning(f"Server error {resp.status_code} on {url}. Retry {attempt+1}/{max_retries} in {wait}s")
-                time.sleep(wait)
+                await asyncio.sleep(wait)
                 continue
 
             return resp
 
-        except (requests.ConnectionError, requests.Timeout) as e:
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
             if attempt < max_retries:
                 wait = (2 ** attempt) * 2
                 logger.warning(f"Network error on {url}: {e}. Retry {attempt+1}/{max_retries} in {wait}s")
-                time.sleep(wait)
+                await asyncio.sleep(wait)
                 continue
             return None
 
@@ -119,165 +123,90 @@ def _set_error(msg: str):
     logger.warning(msg)
 
 
-def search_query(query: str, max_results: int = 10) -> List[Dict[str, str]]:
-    global last_search_error
-    last_search_error = None
-
-    cached = _cache_get(query, max_results)
-    if cached is not None:
-        logger.debug(f"Cache hit for query: {query[:60]}")
-        return cached
-
-    if Config.SEARCH_ENGINE == "serpapi" or (Config.SERPAPI_KEY and Config.SEARCH_ENGINE == "duckduckgo"):
-        if Config.SERPAPI_KEY:
-            results = _search_serpapi(query, max_results)
-            if results:
-                _cache_set(query, max_results, results)
-                return results
-            logger.warning("SerpAPI returned no results, falling back.")
-
-    if Config.SEARCH_ENGINE == "google" or (Config.GOOGLE_API_KEY and Config.GOOGLE_CX):
-        if Config.GOOGLE_API_KEY and Config.GOOGLE_CX:
-            results = _search_google_custom(query, max_results)
-            if results:
-                _cache_set(query, max_results, results)
-                return results
-            logger.warning("Google Custom Search returned no results, falling back.")
-
-    results = _search_duckduckgo(query, max_results)
-    if results:
-        _cache_set(query, max_results, results)
-        return results
-
-    results = _search_ddg_lite(query, max_results)
-    if results:
-        _cache_set(query, max_results, results)
-        return results
-
-    results = _search_ddg_html(query, max_results)
-    if results:
-        _cache_set(query, max_results, results)
-        return results
-
-    results = _search_bing_html(query, max_results)
-    if results:
-        _cache_set(query, max_results, results)
-        return results
-
-    _set_error("All search backends returned no results. Try again later or configure SerpAPI/Google API keys in the sidebar.")
-    return []
-
-
-def _search_ddg_lite(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+async def _asearch_ddg_lite(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     url = "https://lite.duckduckgo.com/lite/"
     headers = _rand_headers()
     headers["Content-Type"] = "application/x-www-form-urlencoded"
     headers["Referer"] = "https://lite.duckduckgo.com/"
 
     try:
-        time.sleep(0.5)
-        response = _retry(url, method="POST", params={"q": query}, headers=headers)
-
+        response = await _aretry(url, method="POST", data={"q": query}, headers=headers)
         if response is None:
             _set_error("DuckDuckGo Lite search failed after retries (network error).")
             return []
-
         if response.status_code != 200:
             _set_error(f"DuckDuckGo Lite search returned HTTP {response.status_code}.")
             return []
-
         if _is_captcha(response.text):
             _set_error("DuckDuckGo is blocking the search (CAPTCHA or rate limit).")
             return []
 
         soup = BeautifulSoup(response.content, "html.parser")
         links = soup.find_all("a", class_="result-link")
-
         if not links:
             _set_error("DuckDuckGo Lite returned no results for this query.")
             return []
 
         results = []
         snippets = soup.find_all("td", class_="result-snippet")
-
         for idx, link_tag in enumerate(links[:max_results]):
             title = link_tag.get_text(strip=True)
             link = link_tag.get("href", "")
-
             snippet = ""
             if idx < len(snippets):
                 snippet = snippets[idx].get_text().strip()
                 snippet = re.sub(r"\s+", " ", snippet)
-
-            results.append({
-                "title": title,
-                "link": link,
-                "snippet": snippet,
-            })
-
+            results.append({"title": title, "link": link, "snippet": snippet})
         return results
     except Exception as e:
         logger.error(f"DuckDuckGo Lite scrape error: {e}")
         return []
 
 
-def _search_duckduckgo(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+async def _asearch_duckduckgo(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     try:
-        import os as _os
-        try:
-            import certifi as _certifi
-            _os.environ.setdefault("SSL_CERT_FILE", _certifi.where())
-        except Exception:
-            pass
-
         from ddgs import DDGS
 
-        time.sleep(0.5)
+        def _run_ddg():
+            with DDGS(timeout=Config.TIMEOUT) as ddgs:
+                return list(ddgs.text(query, max_results=max_results))
 
-        with DDGS(timeout=Config.TIMEOUT) as ddgs:
-            ddg_results = list(ddgs.text(query, max_results=max_results))
-            if ddg_results:
-                results = []
-                for r in ddg_results:
-                    results.append({
-                        "title": r.get("title", ""),
-                        "link": r.get("href", ""),
-                        "snippet": r.get("body", ""),
-                    })
-                if results:
-                    return results
+        ddg_results = await asyncio.to_thread(_run_ddg)
+        if ddg_results:
+            return [
+                {
+                    "title": r.get("title", ""),
+                    "link": r.get("href", ""),
+                    "snippet": r.get("body", ""),
+                }
+                for r in ddg_results
+            ]
     except Exception as e:
         logger.error(f"DuckDuckGo library error: {e}")
 
     logger.info("DDG library returned no results, falling back to HTML scraping.")
-    return _search_ddg_html(query, max_results)
+    return await _asearch_ddg_html(query, max_results)
 
 
-def _search_ddg_html(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+async def _asearch_ddg_html(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     url = "https://html.duckduckgo.com/html/"
     headers = _rand_headers()
     headers["Referer"] = "https://duckduckgo.com/"
-    params = {"q": query}
 
     try:
-        time.sleep(1.0)
-        response = _retry(url, params=params, headers=headers)
-
+        response = await _aretry(url, params={"q": query}, headers=headers)
         if response is None:
             _set_error("DuckDuckGo HTML search failed after retries (network error).")
             return []
-
         if response.status_code != 200:
             _set_error(f"DuckDuckGo HTML search returned HTTP {response.status_code}.")
             return []
-
         if _is_captcha(response.text):
             _set_error("DuckDuckGo is blocking the search (CAPTCHA or rate limit). Try again later or use a different search backend.")
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
         search_divs = soup.find_all("div", class_="result")
-
         if not search_divs:
             if soup.find("div", class_="no-results"):
                 _set_error("DuckDuckGo returned no results for this query.")
@@ -290,81 +219,58 @@ def _search_ddg_html(query: str, max_results: int = 10) -> List[Dict[str, str]]:
             title_a = div.find("a", class_="result__a")
             if not title_a:
                 continue
-
             title = title_a.get_text(strip=True)
             raw_link = title_a.get("href", "")
-
             link = raw_link
             if "/l/?" in raw_link:
                 parsed_url = urllib.parse.urlparse(raw_link)
                 queries = urllib.parse.parse_qs(parsed_url.query)
                 if "uddg" in queries:
                     link = queries["uddg"][0]
-
             snippet_a = div.find("a", class_="result__snippet")
             snippet = snippet_a.get_text(strip=True) if snippet_a else ""
-
-            results.append({
-                "title": title,
-                "link": link,
-                "snippet": snippet,
-            })
-
+            results.append({"title": title, "link": link, "snippet": snippet})
         return results
     except Exception as e:
         logger.error(f"DuckDuckGo HTML scrape error: {e}")
         return []
 
 
-def _search_bing_html(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+async def _asearch_bing_html(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     url = "https://www.bing.com/search"
     headers = _rand_headers()
     headers["Accept-Language"] = "it-IT,it;q=0.9,en;q=0.8"
-    params = {"q": query, "count": min(max_results, 20)}
 
     try:
-        time.sleep(1.0)
-        response = _retry(url, params=params, headers=headers)
-
+        response = await _aretry(url, params={"q": query, "count": min(max_results, 20)}, headers=headers)
         if response is None:
             return []
-
         if response.status_code != 200:
             logger.warning(f"Bing search returned HTTP {response.status_code}")
             return []
-
         if _is_captcha(response.text):
             logger.warning("Bing is blocking the search request.")
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
         results = []
-
         for el in soup.select("li.b_algo")[:max_results]:
             title_link = el.select_one("h2 a")
             if not title_link:
                 continue
-
             title = title_link.get_text(strip=True)
             link = title_link.get("href", "")
-
             snippet_el = el.select_one(".b_caption p") or el.select_one("p.b_lineclamp2")
             snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-
             if title and link:
-                results.append({
-                    "title": title,
-                    "link": link,
-                    "snippet": snippet,
-                })
-
+                results.append({"title": title, "link": link, "snippet": snippet})
         return results
     except Exception as e:
         logger.error(f"Bing HTML scrape error: {e}")
         return []
 
 
-def _search_serpapi(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+async def _asearch_serpapi(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     try:
         url = "https://serpapi.com/search"
         params = {
@@ -375,18 +281,17 @@ def _search_serpapi(query: str, max_results: int = 10) -> List[Dict[str, str]]:
             "hl": "it",
             "gl": "it",
         }
-        response = _retry(url, params=params)
-
+        response = await _aretry(url, params=params)
         if response and response.status_code == 200:
             data = response.json()
-            results = []
-            for item in data.get("organic_results", [])[:max_results]:
-                results.append({
+            return [
+                {
                     "title": item.get("title", ""),
                     "link": item.get("link", ""),
                     "snippet": item.get("snippet", ""),
-                })
-            return results
+                }
+                for item in data.get("organic_results", [])[:max_results]
+            ]
         elif response:
             logger.error(f"SerpAPI HTTP {response.status_code}: {response.text[:200]}")
         else:
@@ -396,7 +301,7 @@ def _search_serpapi(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     return []
 
 
-def _search_google_custom(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+async def _asearch_google_custom(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     try:
         url = "https://www.googleapis.com/customsearch/v1"
         params = {
@@ -406,18 +311,17 @@ def _search_google_custom(query: str, max_results: int = 10) -> List[Dict[str, s
             "num": min(max_results, 10),
             "hl": "it",
         }
-        response = _retry(url, params=params)
-
+        response = await _aretry(url, params=params)
         if response and response.status_code == 200:
             data = response.json()
-            results = []
-            for item in data.get("items", []):
-                results.append({
+            return [
+                {
                     "title": item.get("title", ""),
                     "link": item.get("link", ""),
                     "snippet": item.get("snippet", ""),
-                })
-            return results
+                }
+                for item in data.get("items", [])
+            ]
         elif response:
             logger.error(f"Google Custom Search HTTP {response.status_code}")
         else:
@@ -425,3 +329,55 @@ def _search_google_custom(query: str, max_results: int = 10) -> List[Dict[str, s
     except Exception as e:
         logger.error(f"Google Custom Search error: {e}")
     return []
+
+
+async def asearch_query(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+    global last_search_error
+    last_search_error = None
+
+    cached = _cache_get(query, max_results)
+    if cached is not None:
+        logger.debug(f"Cache hit for query: {query[:60]}")
+        return cached
+
+    tasks: List[asyncio.Task] = []
+
+    if Config.SERPAPI_KEY and (Config.SEARCH_ENGINE == "serpapi" or Config.SEARCH_ENGINE == "duckduckgo"):
+        tasks.append(asyncio.create_task(_asearch_serpapi(query, max_results)))
+
+    if Config.GOOGLE_API_KEY and Config.GOOGLE_CX and (Config.SEARCH_ENGINE == "google" or Config.SEARCH_ENGINE == "duckduckgo"):
+        tasks.append(asyncio.create_task(_asearch_google_custom(query, max_results)))
+
+    tasks.append(asyncio.create_task(_asearch_duckduckgo(query, max_results)))
+    tasks.append(asyncio.create_task(_asearch_ddg_lite(query, max_results)))
+    tasks.append(asyncio.create_task(_asearch_ddg_html(query, max_results)))
+    tasks.append(asyncio.create_task(_asearch_bing_html(query, max_results)))
+
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+    for task in done:
+        try:
+            result = task.result()
+            if result:
+                for p in pending:
+                    p.cancel()
+                _cache_set(query, max_results, result)
+                return result
+        except Exception:
+            continue
+
+    for task in pending:
+        try:
+            result = await task
+            if result:
+                _cache_set(query, max_results, result)
+                return result
+        except Exception:
+            continue
+
+    _set_error("All search backends returned no results. Try again later or configure SerpAPI/Google API keys in the sidebar.")
+    return []
+
+
+def search_query(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+    return asyncio.run(asearch_query(query, max_results))

@@ -1,105 +1,90 @@
 import xml.etree.ElementTree as ET
-import requests
 import re
+import asyncio
+import httpx
 from .config import Config
+from .utils import USER_AGENT
 
-def check_vat(vat_number: str) -> dict:
-    """
-    Validates an Italian VAT (Partita IVA) via the EU VIES service and retrieves
-    official registered company name and address.
-    """
-    # Clean the input, keeping only digits
-    cleaned_vat = re.sub(r"\D", "", vat_number)
-    
-    # Italian VAT is exactly 11 digits
-    if len(cleaned_vat) != 11:
-        return {
-            "valid": False,
-            "vat": cleaned_vat,
-            "error": "Invalid format. Italian VAT number must contain exactly 11 digits."
-        }
+SOAP_URL = "https://ec.europa.eu/taxation_customs/vies/services/checkVatService"
+SOAP_HEADERS = {
+    "Content-Type": "text/xml; charset=utf-8",
+    "SOAPAction": "",
+    "User-Agent": USER_AGENT,
+}
 
-    soap_url = "https://ec.europa.eu/taxation_customs/vies/services/checkVatService"
-    headers = {
-        "Content-Type": "text/xml; charset=utf-8",
-        "SOAPAction": ""
-    }
-    
-    # SOAP Envelope for checking VAT
-    payload = f"""<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
+
+def _soap_payload(vat: str) -> str:
+    return f"""<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
    <soapenv:Header/>
    <soapenv:Body>
       <urn:checkVat>
          <urn:countryCode>IT</urn:countryCode>
-         <urn:vatNumber>{cleaned_vat}</urn:vatNumber>
+         <urn:vatNumber>{vat}</urn:vatNumber>
       </urn:checkVat>
    </soapenv:Body>
 </soapenv:Envelope>"""
 
+
+def _parse_response(text: str, cleaned_vat: str) -> dict:
+    root = ET.fromstring(text)
+
+    def find_tag(name):
+        for elem in root.iter():
+            if elem.tag.endswith(name):
+                return elem.text
+        return None
+
+    fault = find_tag("faultstring")
+    if fault:
+        return {"valid": False, "vat": cleaned_vat, "error": f"VIES fault: {fault}"}
+
+    valid_str = find_tag("valid")
+    is_valid = str(valid_str).lower() == "true"
+
+    if not is_valid:
+        return {"valid": False, "vat": cleaned_vat, "error": "VAT number is invalid or inactive."}
+
+    company_name = find_tag("name")
+    address = find_tag("address")
+    if company_name:
+        company_name = re.sub(r"\s+", " ", company_name).strip()
+    if address:
+        address = re.sub(r"\s+", " ", address).strip()
+
+    return {
+        "valid": True,
+        "vat": cleaned_vat,
+        "company_name": company_name or "Unknown Registry Name",
+        "address": address or "Address not provided in VIES",
+    }
+
+
+async def acheck_vat(vat_number: str) -> dict:
+    cleaned_vat = re.sub(r"\D", "", vat_number)
+    if len(cleaned_vat) != 11:
+        return {
+            "valid": False,
+            "vat": cleaned_vat,
+            "error": "Invalid format. Italian VAT number must contain exactly 11 digits.",
+        }
+
     try:
-        response = requests.post(soap_url, data=payload, headers=headers, timeout=Config.TIMEOUT)
+        async with httpx.AsyncClient(timeout=Config.TIMEOUT, follow_redirects=True) as client:
+            response = await client.post(
+                SOAP_URL, content=_soap_payload(cleaned_vat), headers=SOAP_HEADERS
+            )
         if response.status_code != 200:
             return {
                 "valid": False,
                 "vat": cleaned_vat,
-                "error": f"VIES service unavailable (HTTP {response.status_code})."
+                "error": f"VIES service unavailable (HTTP {response.status_code}).",
             }
-        
-        # Parse XML response
-        root = ET.fromstring(response.text)
-        
-        # Helper to find elements ignoring namespace namespaces
-        def find_tag(name):
-            for elem in root.iter():
-                if elem.tag.endswith(name):
-                    return elem.text
-            return None
-
-        # Check if there is a SOAP fault
-        fault = find_tag("faultstring")
-        if fault:
-            return {
-                "valid": False,
-                "vat": cleaned_vat,
-                "error": f"VIES fault: {fault}"
-            }
-
-        valid_str = find_tag("valid")
-        is_valid = str(valid_str).lower() == "true"
-
-        if not is_valid:
-            return {
-                "valid": False,
-                "vat": cleaned_vat,
-                "error": "VAT number is invalid or inactive."
-            }
-
-        company_name = find_tag("name")
-        address = find_tag("address")
-
-        # Clean string formats
-        if company_name:
-            # Convert ---, etc to empty or strip formatting
-            company_name = re.sub(r"\s+", " ", company_name).strip()
-        if address:
-            address = re.sub(r"\s+", " ", address).strip()
-
-        return {
-            "valid": True,
-            "vat": cleaned_vat,
-            "company_name": company_name or "Unknown Registry Name",
-            "address": address or "Address not provided in VIES"
-        }
-        
-    except requests.RequestException as e:
-        return {
-            "valid": False,
-            "vat": cleaned_vat,
-            "error": f"VIES connection error: {str(e)}"
-        }
+        return _parse_response(response.text, cleaned_vat)
+    except httpx.RequestError as e:
+        return {"valid": False, "vat": cleaned_vat, "error": f"VIES connection error: {e}"}
     except ET.ParseError:
-        return {
-            "valid": False,
-            "vat": cleaned_vat,
-            "error": "Failed to parse VIES XML response."
-        }
+        return {"valid": False, "vat": cleaned_vat, "error": "Failed to parse VIES XML response."}
+
+
+def check_vat(vat_number: str) -> dict:
+    return asyncio.run(acheck_vat(vat_number))
