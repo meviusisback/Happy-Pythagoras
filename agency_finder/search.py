@@ -64,9 +64,9 @@ async def _aretry(
     data: Optional[Dict] = None,
     headers: Optional[Dict] = None,
     timeout: Optional[int] = None,
+    max_retries: int = 1,
 ) -> Optional[httpx.Response]:
-    max_retries = 3
-    timeout = timeout or Config.TIMEOUT
+    timeout = timeout or 4
 
     for attempt in range(max_retries + 1):
         try:
@@ -79,10 +79,12 @@ async def _aretry(
                     raise ValueError(f"Unsupported method: {method}")
 
             if resp.status_code == 429:
-                wait = (2 ** attempt) * 2
-                logger.warning(f"Rate limited (429) on {url}. Retry {attempt+1}/{max_retries} in {wait}s")
-                await asyncio.sleep(wait)
-                continue
+                if attempt < max_retries:
+                    wait = (2 ** attempt) * 2
+                    logger.warning(f"Rate limited (429) on {url}. Retry {attempt+1}/{max_retries} in {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+                return None
 
             if resp.status_code >= 500 and attempt < max_retries:
                 wait = (2 ** attempt) * 2
@@ -94,9 +96,7 @@ async def _aretry(
 
         except (httpx.ConnectError, httpx.TimeoutException) as e:
             if attempt < max_retries:
-                wait = (2 ** attempt) * 2
-                logger.warning(f"Network error on {url}: {e}. Retry {attempt+1}/{max_retries} in {wait}s")
-                await asyncio.sleep(wait)
+                logger.warning(f"Network error on {url}: {e}. Retry {attempt+1}/{max_retries}")
                 continue
             return None
 
@@ -184,8 +184,7 @@ async def _asearch_duckduckgo(query: str, max_results: int = 10) -> List[Dict[st
     except Exception as e:
         logger.error(f"DuckDuckGo library error: {e}")
 
-    logger.info("DDG library returned no results, falling back to HTML scraping.")
-    return await _asearch_ddg_html(query, max_results)
+    return []
 
 
 async def _asearch_ddg_html(query: str, max_results: int = 10) -> List[Dict[str, str]]:
@@ -349,31 +348,26 @@ async def asearch_query(query: str, max_results: int = 10) -> List[Dict[str, str
         tasks.append(asyncio.create_task(_asearch_google_custom(query, max_results)))
 
     tasks.append(asyncio.create_task(_asearch_duckduckgo(query, max_results)))
-    tasks.append(asyncio.create_task(_asearch_ddg_lite(query, max_results)))
-    tasks.append(asyncio.create_task(_asearch_ddg_html(query, max_results)))
     tasks.append(asyncio.create_task(_asearch_bing_html(query, max_results)))
 
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED, timeout=10)
+    except (asyncio.TimeoutError, TimeoutError):
+        for t in tasks:
+            t.cancel()
+        done, pending = set(), set()
 
     for task in done:
         try:
             result = task.result()
             if result:
-                for p in pending:
-                    p.cancel()
                 _cache_set(query, max_results, result)
                 return result
         except Exception:
             continue
 
-    for task in pending:
-        try:
-            result = await task
-            if result:
-                _cache_set(query, max_results, result)
-                return result
-        except Exception:
-            continue
+    for p in pending:
+        p.cancel()
 
     _set_error("All search backends returned no results. Try again later or configure SerpAPI/Google API keys in the sidebar.")
     return []

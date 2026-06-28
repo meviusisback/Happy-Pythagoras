@@ -9,6 +9,7 @@ from agency_finder.core import (
     _role_tier, ROLE_CLAUSE, IGNORE_DOMAINS,
     _afetch_awwwards_portfolio, _afetch_designrush_profile,
     _afetch_themanifest_profile,
+    _result_is_relevant, _avat_bonus, _acheck_vat_on_page,
 )
 from agency_finder.utils import strip_diacritics
 
@@ -941,6 +942,126 @@ class TestRoleClauseCommercial(unittest.TestCase):
 
     def test_contains_country_manager(self):
         self.assertIn("country manager", ROLE_CLAUSE.lower())
+
+
+class TestSearchOuterTimeout(unittest.TestCase):
+
+    @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_duckduckgo", new_callable=AsyncMock)
+    def test_asearch_completes_within_timeout(self, mock_ddg, mock_bing):
+        import asyncio
+        async def _slow(*a, **kw):
+            await asyncio.sleep(200)
+            return []
+        mock_ddg.side_effect = _slow
+        mock_bing.side_effect = _slow
+        from agency_finder.search import asearch_query
+        import time
+        t0 = time.time()
+        result = asyncio.run(asyncio.wait_for(asearch_query("test", 3), timeout=15))
+        elapsed = time.time() - t0
+        self.assertIsInstance(result, list)
+        self.assertLess(elapsed, 15)
+
+    @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_duckduckgo", new_callable=AsyncMock)
+    def test_returns_cached_result_immediately(self, mock_ddg, mock_bing):
+        import asyncio
+        from agency_finder.search import _cache_set
+        _cache_set("cached_query", 5, [{"title": "cached", "link": "http://x", "snippet": ""}])
+        mock_ddg.side_effect = lambda *a, **kw: (_ for _ in ()).throw(Exception("should not be called"))
+        mock_bing.side_effect = lambda *a, **kw: (_ for _ in ()).throw(Exception("should not be called"))
+        from agency_finder.search import asearch_query
+        result = asyncio.run(asearch_query("cached_query", 5))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["title"], "cached")
+
+
+class TestRelevanceFilter(unittest.TestCase):
+
+    def test_2word_name_passes_with_one_word_in_title(self):
+        result = {"title": "Cantiere Creativo", "link": "https://example.com", "snippet": ""}
+        self.assertTrue(_result_is_relevant(result, "Cantiere Creativo"))
+
+    def test_2word_name_passes_with_one_word_in_snippet(self):
+        result = {"title": "Web Agency", "link": "https://example.com", "snippet": "Specializzati in cantiere"}
+        self.assertTrue(_result_is_relevant(result, "Cantiere Creativo"))
+
+    def test_2word_name_passes_when_link_contains_word(self):
+        result = {"title": "Something else", "link": "https://cantierecreativo.net/servizi", "snippet": "no match"}
+        self.assertTrue(_result_is_relevant(result, "Cantiere Creativo"))
+
+    def test_2word_name_rejects_no_match_at_all(self):
+        result = {"title": "Pizzeria Romana", "link": "https://pizzeria.it", "snippet": "pizza napoletana"}
+        self.assertFalse(_result_is_relevant(result, "Cantiere Creativo"))
+
+    def test_empty_name_always_passes(self):
+        result = {"title": "Anything", "link": "http://x", "snippet": ""}
+        self.assertTrue(_result_is_relevant(result, ""))
+
+    def test_3word_name_requires_2_matches(self):
+        result = {"title": "Web Agency Milano", "link": "http://x", "snippet": "web agency milano srl"}
+        self.assertTrue(_result_is_relevant(result, "Web Agency Milano"))
+
+    def test_3word_name_rejects_only_1_match(self):
+        result = {"title": "Solo Milano", "link": "http://x", "snippet": "a Milano"}
+        self.assertFalse(_result_is_relevant(result, "Web Agency Milano"))
+
+
+class TestVatDisambiguation(unittest.TestCase):
+
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_vat_bonus_positive_when_page_shows_vat(self, MockClient):
+        import asyncio
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "text/html"}
+        mock_resp.text = "P.IVA 01234567890 - Cantiere Creativo S.r.l."
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
+        bonuses = asyncio.run(_avat_bonus(
+            ["https://cantierecreativo.net", "https://cantierecreativo.info"],
+            "01234567890",
+        ))
+        self.assertEqual(bonuses["https://cantierecreativo.net"], 50)
+        self.assertEqual(bonuses["https://cantierecreativo.info"], 50)
+
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_vat_bonus_negative_when_page_missing_vat(self, MockClient):
+        import asyncio
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "text/html"}
+        mock_resp.text = "Welcome to our site"
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
+        bonuses = asyncio.run(_avat_bonus(
+            ["https://other-site.com"],
+            "01234567890",
+        ))
+        self.assertEqual(bonuses["https://other-site.com"], -10)
+
+    def test_vat_bonus_empty_when_no_vat(self):
+        import asyncio
+        bonuses = asyncio.run(_avat_bonus(["https://x.com"], ""))
+        self.assertEqual(bonuses, {})
+
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_vat_bonus_handles_network_error(self, MockClient):
+        import asyncio
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=Exception("connection refused"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
+        bonuses = asyncio.run(_avat_bonus(["https://x.com"], "01234567890"))
+        self.assertEqual(bonuses["https://x.com"], -10)
 
 
 if __name__ == "__main__":

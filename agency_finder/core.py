@@ -97,9 +97,9 @@ def _score_html(html: str, final_url: str, url: str, name_lower: str, name_words
         score -= 10
 
     if name_lower in title.lower():
-        score += 20
-    elif name_words and any(w in title.lower() for w in name_words):
         score += 10
+    elif name_words and any(w in title.lower() for w in name_words):
+        score += 5
 
     if name_lower in text_body.lower():
         score += 15
@@ -175,6 +175,28 @@ def _collect_candidates(results: List[Dict[str, str]]) -> List[str]:
     return candidates
 
 
+async def _acheck_vat_on_page(url: str, vat: str) -> bool:
+    """Check whether a page displays the given VAT number."""
+    try:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.9"})
+        if resp.status_code != 200:
+            return False
+        if "text/html" not in resp.headers.get("Content-Type", ""):
+            return False
+        return vat in resp.text
+    except Exception:
+        return False
+
+
+async def _avat_bonus(candidates: List[str], vat: str) -> Dict[str, int]:
+    """For each candidate URL, return +50 if it displays the VAT, else -10."""
+    if not candidates or not vat:
+        return {}
+    checks = await asyncio.gather(*[_acheck_vat_on_page(c, vat) for c in candidates])
+    return {c: (50 if found else -10) for c, found in zip(candidates, checks)}
+
+
 def _has_meaningful_data(result: Dict[str, Any]) -> bool:
     return bool(result.get("emails")) or bool(result.get("telephones")) or bool(result.get("services")) or bool(result.get("extracted_address"))
 
@@ -239,8 +261,11 @@ def _result_is_relevant(result: Dict[str, str], agency_name: str) -> bool:
     name_words = [w for w in name_lower.split() if len(w) > 2]
     if not name_words:
         return True
+    link_lower = result.get("link", "").lower()
+    if any(w in link_lower for w in name_words):
+        return True
     if len(name_words) <= 2:
-        return all(w in haystack for w in name_words)
+        return any(w in haystack for w in name_words)
     matches = sum(1 for w in name_words if w in haystack)
     return matches >= max(2, len(name_words) // 2)
 
@@ -897,6 +922,16 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
         if progress_cb:
             progress_cb(f"Evaluating {len(candidates)} candidate websites...")
         scored_candidates = list(await asyncio.gather(*[_ascore_website(url, query_name) for url in candidates]))
+
+        if result["vat_number"] and result["vies_valid"]:
+            vat = result["vat_number"]
+            if progress_cb:
+                progress_cb(f"Checking which candidate website displays P.IVA {vat}...")
+            vat_bonuses = await _avat_bonus([sc["url"] for sc in scored_candidates], vat)
+            for sc in scored_candidates:
+                sc["score"] += vat_bonuses.get(sc["url"], 0)
+            logger.info(f"VAT {vat} bonus applied: { {k: v for k, v in vat_bonuses.items()} }")
+
         scored_candidates.sort(key=lambda x: (x["score"], -len(x["url"])), reverse=True)
         candidate_log = [f'{s["url"]} (score={s["score"]})' for s in scored_candidates]
         logger.info(f"Website candidates: {candidate_log}")
