@@ -30,6 +30,27 @@ class TestAiConfig(unittest.TestCase):
         self.assertIn("deepseek", providers)
         self.assertIn("opencodego", providers)
 
+    def test_opencodego_base_url(self):
+        info = provider_info("opencodego")
+        self.assertEqual(info["base_url"], "https://opencode.ai/zen/go/v1")
+
+    def test_opencodego_supports_models_endpoint(self):
+        info = provider_info("opencodego")
+        self.assertTrue(info["supports_models_endpoint"])
+
+    def test_opencodego_fallback_models(self):
+        info = provider_info("opencodego")
+        expected = [
+            "minimax-m3", "minimax-m2.7", "minimax-m2.5",
+            "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5",
+            "glm-5.2", "glm-5.1", "glm-5",
+            "deepseek-v4-pro", "deepseek-v4-flash",
+            "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus",
+            "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro", "mimo-v2.5",
+            "hy3-preview",
+        ]
+        self.assertEqual(info["fallback_models"], expected)
+
     def test_provider_info_known(self):
         info = provider_info("openai")
         self.assertEqual(info["label"], "OpenAI")
@@ -244,12 +265,30 @@ class TestAiProviders(unittest.TestCase):
         self.assertTrue(len(models) > 0)
         self.assertIn("gpt-4o-mini", models)
 
-    def test_alist_models_skips_endpoint_when_flag_false(self):
+    @patch("agency_finder.ai_providers._get_openai_client")
+    def test_alist_models_opencodego_with_api(self, mock_get_client):
         set_api_key("opencodego", "sk-test")
         try:
+            mock_client = MagicMock()
+            models_data = [
+                "minimax-m3", "minimax-m2.7", "minimax-m2.5",
+                "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5",
+                "glm-5.2", "glm-5.1", "glm-5",
+                "deepseek-v4-pro", "deepseek-v4-flash",
+                "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus",
+                "mimo-v2-pro", "mimo-v2-omni", "mimo-v2.5-pro", "mimo-v2.5",
+                "hy3-preview",
+            ]
+            mock_models = [MagicMock(id=m, object="model") for m in models_data]
+            mock_response = MagicMock()
+            mock_response.data = mock_models
+            mock_client.models.list = AsyncMock(return_value=mock_response)
+            mock_get_client.return_value = mock_client
+
             models = asyncio.run(alist_models("opencodego"))
-            self.assertTrue(len(models) > 0)
-            self.assertEqual(models, ["opencode/default"])
+            self.assertEqual(len(models), 20)
+            for m in models_data:
+                self.assertIn(m, models)
         finally:
             clear_api_key("opencodego")
 
@@ -258,13 +297,13 @@ class TestAiProviders(unittest.TestCase):
             asyncio.run(achat("unknown", "model", [{"role": "user", "content": "Hi"}]))
     
     @patch("agency_finder.ai_providers._get_openai_client")
-    def test_achat_openai_handles_string_response(self, mock_get_client):
+    def test_achat_openai_handles_json_string_response(self, mock_get_client):
         mock_client = MagicMock()
-        mock_client.chat.completions.create = AsyncMock(return_value="raw string response")
+        mock_client.chat.completions.create = AsyncMock(return_value='{"content": "response"}')
         mock_get_client.return_value = mock_client
 
         result = asyncio.run(achat("openai", "gpt-4o-mini", [{"role": "user", "content": "Hi"}]))
-        self.assertEqual(result, "raw string response")
+        self.assertEqual(result, '{"content": "response"}')
     
     @patch("agency_finder.ai_providers._get_openai_client")
     def test_achat_json_openai_handles_string_response(self, mock_get_client):
@@ -289,6 +328,27 @@ class TestAiProviders(unittest.TestCase):
         asyncio.run(achat_json("openai", "gpt-4o-mini", [{"role": "user", "content": "Test"}], schema=AIQueryResult))
         _, call_kwargs = mock_client.chat.completions.create.call_args
         self.assertEqual(call_kwargs["response_format"], {"type": "json_object"})
+
+    @patch("agency_finder.ai_providers._get_openai_client")
+    def test_achat_openai_non_json_string_raises_clean_error(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value="Not Found")
+        mock_get_client.return_value = mock_client
+
+        with self.assertRaises(AIError) as ctx:
+            asyncio.run(achat("openai", "gpt-4o-mini", [{"role": "user", "content": "Hi"}]))
+        self.assertIn("non-chat response", str(ctx.exception))
+
+    @patch("agency_finder.ai_providers._get_openai_client")
+    def test_achat_json_openai_non_json_string_raises_clean_error(self, mock_get_client):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(return_value="Not Found")
+        mock_get_client.return_value = mock_client
+
+        from agency_finder.ai_schemas import AIQueryResult
+        with self.assertRaises(AIError) as ctx:
+            asyncio.run(achat_json("openai", "gpt-4o-mini", [{"role": "user", "content": "Test"}], schema=AIQueryResult))
+        self.assertIn("non-JSON response", str(ctx.exception))
 
 
 class TestAiPipeline(unittest.TestCase):

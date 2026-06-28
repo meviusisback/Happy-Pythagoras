@@ -4,11 +4,10 @@ import logging
 from typing import Optional, List, Type
 
 try:
-    from pydantic import BaseModel
+    from pydantic import BaseModel, ValidationError
     _PYDANTIC_AVAILABLE = True
 except ImportError:
-    class BaseModel:
-        pass
+    ValidationError = Exception
     _PYDANTIC_AVAILABLE = False
 
 from .ai_config import get_api_key, provider_info
@@ -32,8 +31,6 @@ def _get_openai_client(provider: str, timeout: int = 30):
     info = provider_info(provider)
     key = get_api_key(provider)
     base_url = info["base_url"]
-    if not base_url and provider == "opencodego":
-        base_url = "https://api.opencode.ai/v1"
     return AsyncOpenAI(api_key=key, base_url=base_url, timeout=timeout, max_retries=0)
 
 
@@ -101,9 +98,13 @@ async def _achat_openai(provider: str, model: str, messages: list, *,
     try:
         response = await client.chat.completions.create(**kwargs)
         if isinstance(response, str):
+            if not response.lstrip().startswith(("{", "[")):
+                raise AIError(provider, f"Provider returned non-chat response: {response[:100]!r}")
             logger.debug(f"{provider} returned a raw string response")
             return response
         return response.choices[0].message.content or ""
+    except AIError:
+        raise
     except Exception as e:
         status = getattr(e, "status_code", None)
         raise AIError(provider, str(e), status_code=status)
@@ -183,7 +184,14 @@ async def achat_json(provider: str, model: str, messages: list, *,
         schema_desc = _schema_to_description(schema)
         sys_text = (system or "") + "\n\nReturn valid JSON matching this schema:\n" + schema_desc
         raw = await achat(provider, model, messages, system=sys_text, json_mode=True, timeout=timeout)
-        return schema.model_validate_json(raw)
+
+        if not raw or not raw.lstrip().startswith(("{", "[")):
+            raise AIError(provider, f"Provider returned non-JSON response: {raw[:100]!r}")
+
+        try:
+            return schema.model_validate_json(raw)
+        except ValidationError as e:
+            raise AIError(provider, f"Provider returned invalid JSON: {raw[:100]!r}") from None
 
 
 async def _achat_json_openai(provider: str, model: str, messages: list, *,
@@ -208,7 +216,16 @@ async def _achat_json_openai(provider: str, model: str, messages: list, *,
             raw = response
         else:
             raw = response.choices[0].message.content or ""
-        return schema.model_validate_json(raw)
+
+        if not raw or not raw.lstrip().startswith(("{", "[")):
+            raise AIError(provider, f"Provider returned non-JSON response: {raw[:100]!r}")
+
+        try:
+            return schema.model_validate_json(raw)
+        except ValidationError as e:
+            raise AIError(provider, f"Provider returned invalid JSON: {raw[:100]!r}") from None
+    except AIError:
+        raise
     except Exception as e:
         status = getattr(e, "status_code", None)
         raise AIError(provider, str(e), status_code=status)
