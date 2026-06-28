@@ -415,6 +415,23 @@ with tab_single:
                         else:
                             st.markdown("*No client portfolio websites extracted*")
 
+                    sitemap_portfolio = results.get('sitemap_portfolio')
+                    if sitemap_portfolio:
+                        with st.container():
+                            st.subheader("🗂️ Client Sites from Sitemap")
+                            st.caption(f"{len(sitemap_portfolio)} client websites discovered via the agency's sitemap.xml and portfolio pages")
+                            cols_sp = st.columns(3)
+                            for i, client in enumerate(sitemap_portfolio[:18]):
+                                nome = client.get('nome') or client.get('domain', '?')
+                                url = client.get('url', '#')
+                                cols_sp[i % 3].markdown(f"🔗 [{nome}]({url})")
+                            if len(sitemap_portfolio) > 18:
+                                st.markdown("**More sitemap clients:**")
+                                for client in sitemap_portfolio[18:]:
+                                    nome = client.get('nome') or client.get('domain', '?')
+                                    url = client.get('url', '#')
+                                    st.markdown(f"- [{nome}]({url})")
+
                     # Row 5: AI Intelligence (only if available)
                     ai_enhanced = results.get('ai_enhanced')
                     ai_approach = results.get('ai_approach')
@@ -493,6 +510,9 @@ with tab_single:
 
 ## Portfolios/Websites Created
 {chr(10).join(['- ' + d for d in results['portfolio_sites']])}
+
+## Client Sites from Sitemap
+{chr(10).join([f"- [{c.get('nome', c.get('domain', '?'))}]({c.get('url', '#')})" for c in results.get('sitemap_portfolio', [])])}
 
 ## Latest News
 {chr(10).join([f"- [{n['title']}]({n['url']}) — {n.get('source','')} {n.get('date','')}" for n in results.get('latest_news', [])])}

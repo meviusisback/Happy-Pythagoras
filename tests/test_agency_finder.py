@@ -1369,5 +1369,167 @@ class TestSearchRobustness(unittest.TestCase):
         self.assertFalse(any("milano" in u.lower() for u in called_urls))
 
 
+class TestPortfolioFinder(unittest.TestCase):
+
+    def _sitemap_xml(self, urls):
+        body = "".join(f"<url><loc>{u}</loc></url>" for u in urls)
+        return f'<?xml version="1.0"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{body}</urlset>'
+
+    def _portfolio_page(self, client_links):
+        anchors = "".join(f'<a href="{u}">{u.split("//")[1].split("/")[0]}</a>' for u in client_links)
+        return f"<html><body><h1>Portfolio</h1>{anchors}</body></html>"
+
+    @patch("agency_finder.scraper.make_async_client")
+    def test_find_portfolio_from_sitemap(self, mock_client_factory):
+        from agency_finder.scraper import afind_portfolio_websites
+
+        sitemap = self._sitemap_xml([
+            "https://acme.it/",
+            "https://acme.it/portfolio",
+            "https://acme.it/contacts",
+        ])
+        portfolio_html = self._portfolio_page([
+            "https://client1.it",
+            "https://client2.com",
+        ])
+        client1_html = "<html><head><title>Client One Srl</title></head></html>"
+
+        sitemap_resp = MagicMock(status_code=200, text=sitemap)
+        sitemap_resp.headers = {"Content-Type": "application/xml"}
+        portfolio_resp = MagicMock(status_code=200, text=portfolio_html)
+        portfolio_resp.headers = {"Content-Type": "text/html"}
+        client1_resp = MagicMock(status_code=200, text=client1_html)
+        client1_resp.headers = {"Content-Type": "text/html"}
+        client2_resp = MagicMock(status_code=404, text="not found")
+        client2_resp.headers = {"Content-Type": "text/html"}
+
+        resp_map = {
+            "https://acme.it/sitemap.xml": sitemap_resp,
+            "https://acme.it/portfolio": portfolio_resp,
+            "https://client1.it": client1_resp,
+            "https://client2.com": client2_resp,
+        }
+
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def fake_get(url, **kw):
+            r = resp_map.get(url)
+            if r is None:
+                fallback = MagicMock(status_code=200, text="<html></html>")
+                fallback.headers = {"Content-Type": "text/html"}
+                return fallback
+            return r
+        mock_client.get = fake_get
+        mock_client_factory.return_value = mock_client
+
+        result = asyncio.run(afind_portfolio_websites("Acme", "https://acme.it", max_sites=10))
+        self.assertEqual(len(result), 2)
+        domains = {r["domain"] for r in result}
+        self.assertIn("client1.it", domains)
+        self.assertIn("client2.com", domains)
+
+    @patch("agency_finder.scraper.make_async_client")
+    def test_find_portfolio_skips_social_and_cdn(self, mock_client_factory):
+        from agency_finder.scraper import afind_portfolio_websites
+
+        sitemap = self._sitemap_xml(["https://acme.it/portfolio"])
+        portfolio_html = "<html><body>" + "".join([
+            '<a href="https://facebook.com/acme">FB</a>',
+            '<a href="https://instagram.com/acme">IG</a>',
+            '<a href="https://google.com/search">Search</a>',
+            '<a href="https://cdn.jsdelivr.net/npm/jquery">jQuery</a>',
+            '<a href="https://realclient.it">Real Client</a>',
+        ]) + "</body></html>"
+
+        sitemap_resp = MagicMock(status_code=200, text=sitemap)
+        sitemap_resp.headers = {"Content-Type": "application/xml"}
+        portfolio_resp = MagicMock(status_code=200, text=portfolio_html)
+        portfolio_resp.headers = {"Content-Type": "text/html"}
+        client_resp = MagicMock(status_code=200, text="<html><head><title>Real</title></head></html>")
+        client_resp.headers = {"Content-Type": "text/html"}
+
+        resp_map = {
+            "https://acme.it/sitemap.xml": sitemap_resp,
+            "https://acme.it/portfolio": portfolio_resp,
+            "https://realclient.it": client_resp,
+        }
+
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        async def fake_get(url, **kw):
+            return resp_map.get(url, client_resp)
+        mock_client.get = fake_get
+        mock_client_factory.return_value = mock_client
+
+        result = asyncio.run(afind_portfolio_websites("Acme", "https://acme.it", max_sites=10))
+        domains = {r["domain"] for r in result}
+        self.assertEqual(domains, {"realclient.it"})
+        self.assertNotIn("facebook.com", domains)
+        self.assertNotIn("google.com", domains)
+        self.assertNotIn("cdn.jsdelivr.net", domains)
+
+    def test_find_portfolio_uses_tld_filter(self):
+        from agency_finder.scraper import _client_tld_allowed
+        self.assertTrue(_client_tld_allowed("client.it"))
+        self.assertTrue(_client_tld_allowed("client.com"))
+        self.assertTrue(_client_tld_allowed("client.shop"))
+        self.assertTrue(_client_tld_allowed("www.client.com"))
+        self.assertFalse(_client_tld_allowed("client.ru"))
+        self.assertFalse(_client_tld_allowed("client.tk"))
+        self.assertFalse(_client_tld_allowed("client.cn"))
+
+    def test_find_portfolio_dedupes_by_domain(self):
+        from agency_finder.scraper import _extract_external_domains
+        html = """
+        <html><body>
+          <a href="https://www.client1.it/page1">page 1</a>
+          <a href="https://client1.it/page2">page 2</a>
+          <a href="https://client1.it/about">about</a>
+        </body></html>
+        """
+        result = _extract_external_domains(html, "acme.it")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["url"], "https://client1.it/page1")
+
+    @patch("agency_finder.scraper.make_async_client")
+    def test_find_portfolio_no_sitemap_falls_back_to_homepage(self, mock_client_factory):
+        from agency_finder.scraper import afind_portfolio_websites
+
+        sitemap_resp = MagicMock(status_code=404, text="not found")
+        sitemap_resp.headers = {"Content-Type": "text/xml"}
+        homepage_html = "<html><body>" + "".join([
+            '<a href="https://acme.it/about">About</a>',
+            '<a href="https://fallback.it">Fallback Client</a>',
+        ]) + "</body></html>"
+        homepage_resp = MagicMock(status_code=200, text=homepage_html)
+        homepage_resp.headers = {"Content-Type": "text/html"}
+        fallback_resp = MagicMock(status_code=200, text="<html><head><title>Fallback</title></head></html>")
+        fallback_resp.headers = {"Content-Type": "text/html"}
+
+        resp_map = {
+            "https://acme.it/sitemap.xml": sitemap_resp,
+            "https://acme.it/sitemap_index.xml": sitemap_resp,
+            "https://acme.it/sitemap-index.xml": sitemap_resp,
+            "https://acme.it": homepage_resp,
+            "https://acme.it/": homepage_resp,
+            "https://fallback.it": fallback_resp,
+        }
+
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        async def fake_get(url, **kw):
+            return resp_map.get(url, sitemap_resp)
+        mock_client.get = fake_get
+        mock_client_factory.return_value = mock_client
+
+        result = asyncio.run(afind_portfolio_websites("Acme", "https://acme.it", max_sites=10))
+        domains = {r["domain"] for r in result}
+        self.assertIn("fallback.it", domains)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -220,6 +220,25 @@ async def _aextract(website: str, query_name: str, result: Dict[str, Any], progr
         result["portfolio_sites"] = extractor.extract_client_websites_v2()
         result["payment_integration"] = extractor.extract_payment_integrations()
 
+        try:
+            from .scraper import afind_portfolio_websites
+            sitemap_clients = await afind_portfolio_websites(
+                name=query_name or "",
+                url=website,
+                max_sites=25,
+            )
+            if sitemap_clients:
+                existing = set(result.get("portfolio_sites") or [])
+                for d in sitemap_clients:
+                    domain = d.get("domain", "")
+                    if domain and domain not in existing:
+                        result["portfolio_sites"].append(domain)
+                        existing.add(domain)
+                result["sitemap_portfolio"] = sitemap_clients
+                logger.info(f"Sitemap portfolio discovery found {len(sitemap_clients)} clients")
+        except Exception as e:
+            logger.warning(f"Sitemap portfolio discovery failed: {e}")
+
         if query_name:
             scraped_text = " ".join(p.get("text", "") for p in pages).lower()
             name_lower = query_name.lower()
