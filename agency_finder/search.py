@@ -184,12 +184,15 @@ async def _asearch_ddg_lite(query: str, max_results: int = 10) -> List[Dict[str,
 
 
 async def _asearch_duckduckgo(query: str, max_results: int = 10) -> List[Dict[str, str]]:
-    headers = _browser_headers("ddg")
     for backend in ("auto", "html", "lite"):
         try:
             def _run():
-                with DDGS(headers=headers, timeout=Config.TIMEOUT) as ddgs:
-                    return list(ddgs.text(query, region="it-it", backend=backend, max_results=max_results))
+                try:
+                    with DDGS(timeout=Config.TIMEOUT) as ddgs:
+                        return list(ddgs.text(query, region="it-it", backend=backend, max_results=max_results))
+                except TypeError:
+                    with DDGS() as ddgs:
+                        return list(ddgs.text(query, region="it-it", backend=backend, max_results=max_results))
 
             ddg_results = await asyncio.to_thread(_run)
             if ddg_results:

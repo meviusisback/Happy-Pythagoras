@@ -1205,6 +1205,26 @@ class TestSearchRobustness(unittest.TestCase):
         result = asyncio.run(_asearch_duckduckgo("test", 5))
         self.assertEqual(result, [])
 
+    @patch("agency_finder.search.DDGS")
+    def test_ddg_library_falls_back_when_timeout_unsupported(self, mock_ddgs_class):
+        from agency_finder.search import _asearch_duckduckgo
+
+        class OldDDGS:
+            def __init__(self, *a, **kw):
+                if "timeout" in kw:
+                    raise TypeError("unexpected keyword argument 'timeout'")
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def text(self, query, **kw):
+                return [{"title": "fallback ok", "href": "http://x", "body": "y"}]
+
+        mock_ddgs_class.side_effect = OldDDGS
+        result = asyncio.run(_asearch_duckduckgo("test", 5))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["title"], "fallback ok")
+
     @patch("agency_finder.search._aretry")
     def test_ddg_lite_retries_on_empty(self, mock_aretry):
         from agency_finder.search import _asearch_ddg_lite
