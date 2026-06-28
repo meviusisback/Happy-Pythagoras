@@ -279,7 +279,25 @@ with tab_single:
                                 st.markdown("<span class='badge-payment-no'>NO EXPLICIT MENTION FOUND</span>", unsafe_allow_html=True)
                                 st.write("The website does not explicitly list payment gateways (Stripe, PayPal, Nexi, etc.) or ecommerce checkout systems.")
 
-                    # Row 3: Portfolio sites
+                    # Row 3: Latest News
+                    with st.container():
+                        st.subheader("📰 Latest News")
+                        if results.get('latest_news'):
+                            for item in results['latest_news'][:8]:
+                                title = item.get('title', 'Untitled')
+                                url = item.get('url', '#')
+                                source = item.get('source', '')
+                                date = item.get('date', '')
+                                snippet = item.get('snippet', '')
+                                meta_parts = [p for p in [source, date] if p]
+                                meta = " — ".join(meta_parts)
+                                st.markdown(f"**[{title}]({url})**  \n*{meta}*" if meta else f"**[{title}]({url})**")
+                                if snippet:
+                                    st.markdown(f"> {snippet[:200]}{'...' if len(snippet) > 200 else ''}")
+                        else:
+                            st.markdown("*No recent news found*")
+
+                    # Row 4: Portfolio sites
                     with st.container():
                         st.subheader("📂 Websites Created / Worked With")
                         if results['portfolio_sites']:
@@ -318,6 +336,9 @@ with tab_single:
 
 ## Portfolios/Websites Created
 {chr(10).join(['- ' + d for d in results['portfolio_sites']])}
+
+## Latest News
+{chr(10).join([f"- [{n['title']}]({n['url']}) — {n.get('source','')} {n.get('date','')}" for n in results.get('latest_news', [])])}
 """
                     col_dl1, col_dl2 = st.columns(2)
                     with col_dl1:
@@ -419,7 +440,8 @@ with tab_bulk:
                             "Payment Integration": "No",
                             "Payment Providers": "",
                             "Services Count": 0,
-                            "Portfolio Count": 0
+                            "Portfolio Count": 0,
+                            "News Count": 0
                         })
                     else:
                         pay_info = res["payment_integration"]
@@ -436,7 +458,8 @@ with tab_bulk:
                             "Payment Integration": "Yes" if pay_info.get("provides_payment_integration") else "No",
                             "Payment Providers": ", ".join(pay_info.get("payment_providers", [])),
                             "Services Count": len(res.get("services", [])),
-                            "Portfolio Count": len(res.get("portfolio_sites", []))
+                            "Portfolio Count": len(res.get("portfolio_sites", [])),
+                            "News Count": len(res.get("latest_news", []))
                         })
                 
                 results_df = pd.DataFrame(flat_results)

@@ -10,6 +10,7 @@ from .vies import acheck_vat
 from .scraper import WebScraper
 from .extractor import InformationExtractor
 from .utils import make_async_client, USER_AGENT
+from .news import aexternal_news_lookup
 
 logger = logging.getLogger("agency_finder.core")
 
@@ -619,7 +620,8 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
         "portfolio_sites": [],
         "portfolio_detail": [],
         "linkedin_contacts": [],
-        "linkedin_company_url": ""
+        "linkedin_company_url": "",
+        "latest_news": [],
     }
 
     if result["vat_number"]:
@@ -824,11 +826,15 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
         urls_to_try.append(result["website"])
 
     external_portfolio_task = None
+    external_news_task = None
     if query_name:
         if progress_cb:
             progress_cb("Searching external sources for portfolio/client sites (Clutch, Behance, Dribbble, LinkedIn, general)...")
         external_portfolio_task = asyncio.ensure_future(
             aexternal_portfolio_lookup(query_name, result.get("linkedin_company_url", ""), progress_cb)
+        )
+        external_news_task = asyncio.ensure_future(
+            aexternal_news_lookup(query_name, website_domain, result.get("linkedin_company_url", ""), progress_cb)
         )
 
     scraped_ok = False
@@ -866,6 +872,14 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
                 logger.info(f"External portfolio lookup found {len(external_clients)} client domains")
         except Exception as e:
             logger.warning(f"External portfolio lookup failed: {e}")
+
+    if external_news_task is not None:
+        try:
+            result["latest_news"] = await external_news_task
+            if result["latest_news"]:
+                logger.info(f"Found {len(result['latest_news'])} news items for '{query_name}'")
+        except Exception as e:
+            logger.warning(f"External news lookup failed: {e}")
 
     if not scraped_ok and result["website"]:
         result["website"] = ""

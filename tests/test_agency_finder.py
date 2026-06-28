@@ -530,5 +530,111 @@ class TestExternalPortfolioLookup(unittest.TestCase):
         self.assertEqual(results[0]["source"], "generic_search")
 
 
+class TestNewsModule(unittest.TestCase):
+
+    def test_is_relevant_news_match_name(self):
+        from agency_finder.news import _is_relevant_news
+        item = {"title": "Cantiere Creativo Raises €2M in Funding", "url": "https://techcrunch.it/article", "snippet": "The Italian web agency..."}
+        self.assertTrue(_is_relevant_news(item, "Cantiere Creativo", "canticreativo.it"))
+
+    def test_is_relevant_news_match_domain_stem(self):
+        from agency_finder.news import _is_relevant_news
+        item = {"title": "canticreativo.it wins award", "url": "https://techcrunch.it/article", "snippet": "..."}
+        self.assertTrue(_is_relevant_news(item, "Some Unrelated Name", "canticreativo.it"))
+
+    def test_is_relevant_news_reject_irrelevant(self):
+        from agency_finder.news import _is_relevant_news
+        item = {"title": "Unrelated Company Acquired", "url": "https://techcrunch.it/article", "snippet": "A completely different company..."}
+        self.assertFalse(_is_relevant_news(item, "Cantiere Creativo", "canticreativo.it"))
+
+    def test_parse_date_rfc2822(self):
+        from agency_finder.news import _parse_date
+        self.assertEqual(_parse_date("Wed, 15 Jan 2025 10:30:00 +0100"), "2025-01-15")
+
+    def test_parse_date_iso(self):
+        from agency_finder.news import _parse_date
+        self.assertEqual(_parse_date("2025-03-20T14:00:00Z"), "2025-03-20")
+
+    def test_parse_date_empty(self):
+        from agency_finder.news import _parse_date
+        self.assertEqual(_parse_date(""), "")
+
+    @patch("agency_finder.news.httpx.AsyncClient")
+    def test_google_news_rss_parses_xml(self, MockClient):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = """<?xml version="1.0" encoding="UTF-8"?>
+        <rss version="2.0">
+        <channel>
+          <title>Google News</title>
+          <item>
+            <title>Cantiere Creativo presenta nuovo progetto e-commerce</title>
+            <link>https://techcrunch.it/cantiere-creativo-progetto</link>
+            <pubDate>Wed, 15 Jan 2025 10:30:00 +0100</pubDate>
+            <source url="https://techcrunch.it">TechCrunch Italy</source>
+            <description>Cantiere Creativo ha lanciato un nuovo portale e-commerce per il settore moda.</description>
+          </item>
+          <item>
+            <title>Milano vince campionato di calcio</title>
+            <link>https://gazzetta.it/milano-calcio</link>
+            <pubDate>Tue, 14 Jan 2025 09:00:00 +0100</pubDate>
+            <source url="https://gazzetta.it">La Gazzetta</source>
+            <description>Il Milan batte l'Inter 2-1 in derby.</description>
+          </item>
+        </channel>
+        </rss>"""
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
+
+        from agency_finder.news import afetch_google_news_rss
+        import asyncio
+        results = asyncio.run(afetch_google_news_rss("Cantiere Creativo", "canticreativo.it"))
+        self.assertEqual(len(results), 1)
+        self.assertIn("Cantiere Creativo", results[0]["title"])
+        self.assertEqual(results[0]["date"], "2025-01-15")
+        self.assertEqual(results[0]["source"], "TechCrunch Italy")
+
+    @patch("agency_finder.news.asearch_query", new_callable=AsyncMock)
+    def test_ddg_news_filters_irrelevant(self, mock_search):
+        mock_search.side_effect = [
+            [{"title": "Cantiere Creativo Raises Funding", "link": "https://techcrunch.it/cantiere", "snippet": "2025-01-15 Cantiere Creativo raises €2M..."}],
+            [{"title": "Unrelated Corp Acquired", "link": "https://random.it/article", "snippet": "Completely different company..."}],
+        ]
+        from agency_finder.news import afetch_ddg_news
+        import asyncio
+        results = asyncio.run(afetch_ddg_news("Cantiere Creativo", "canticreativo.it"))
+        self.assertEqual(len(results), 1)
+        self.assertIn("Cantiere Creativo", results[0]["title"])
+        self.assertEqual(results[0]["date"], "2025-01-15")
+
+    @patch("agency_finder.news.httpx.AsyncClient")
+    def test_linkedin_posts_returns_empty_on_captcha(self, MockClient):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = '<html><div class="captcha">Verify you are human</div></html>'
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
+
+        from agency_finder.news import afetch_linkedin_posts
+        import asyncio
+        results = asyncio.run(afetch_linkedin_posts("https://linkedin.com/company/acme", "Acme Corp"))
+        self.assertEqual(results, [])
+
+    def test_news_cache_hit(self):
+        from agency_finder.news import NEWS_CACHE, NEWS_CACHE_TTL
+        import time
+        cache_k = "test_cache_key"
+        NEWS_CACHE[cache_k] = (time.time(), [{"title": "cached"}])
+        # Should return cached data without calling any fetchers
+        self.assertIn(cache_k, NEWS_CACHE)
+        del NEWS_CACHE[cache_k]
+
+
 if __name__ == "__main__":
     unittest.main()
