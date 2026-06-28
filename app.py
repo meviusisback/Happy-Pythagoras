@@ -7,6 +7,23 @@ import asyncio
 from agency_finder.core import lookup_agency, alookup_agency
 from agency_finder.config import Config
 from agency_finder.search import last_search_error as _last_search_error
+from agency_finder.ai_config import (
+    get_registered_providers, provider_info, is_configured,
+    set_api_key, clear_all_api_keys, redact_keys,
+)
+from agency_finder.ai_providers import alist_models
+
+
+@st.cache_data(ttl=300)
+def _cached_models(provider: str) -> list[str]:
+    """Fetch available models for a provider, cached for 5 minutes."""
+    if is_configured(provider):
+        try:
+            return asyncio.run(alist_models(provider))
+        except Exception:
+            pass
+    return provider_info(provider).get("fallback_models", [])
+
 
 # Configure Page
 st.set_page_config(
@@ -131,6 +148,54 @@ st.sidebar.subheader("Crawler Constraints")
 Config.MAX_DEPTH = st.sidebar.slider("Max Crawl Depth", min_value=1, max_value=3, value=Config.MAX_DEPTH)
 Config.MAX_PAGES = st.sidebar.slider("Max Pages to Scrape", min_value=3, max_value=30, value=Config.MAX_PAGES)
 Config.TIMEOUT = st.sidebar.slider("Request Timeout (s)", min_value=5, max_value=30, value=Config.TIMEOUT)
+
+# -----------------
+# AI Layer Section
+# -----------------
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧠 AI Layer")
+ai_enabled = st.sidebar.checkbox("Enable AI enhancement", value=Config.AI_ENABLED, key="ai_enabled_checkbox")
+
+if ai_enabled:
+    providers = get_registered_providers()
+    default_idx = providers.index(Config.AI_PROVIDER) if Config.AI_PROVIDER in providers else 0
+    sel_provider = st.sidebar.selectbox(
+        "Provider", options=providers, index=default_idx,
+        format_func=lambda p: provider_info(p)["label"],
+        key="ai_provider_sel",
+    )
+    Config.AI_PROVIDER = sel_provider
+
+    models = _cached_models(sel_provider)
+    default_model_idx = models.index(Config.AI_MODEL) if Config.AI_MODEL in models else 0
+    sel_model = st.sidebar.selectbox("Model", options=models, index=default_model_idx, key="ai_model_sel")
+    Config.AI_MODEL = sel_model
+
+    with st.sidebar.expander("🔑 Manage API Keys"):
+        for p in providers:
+            info = provider_info(p)
+            key_val = st.text_input(
+                f"{info['label']} Key",
+                type="password",
+                value="",
+                placeholder="••••••••" if is_configured(p) else "Enter key...",
+                key=f"ai_key_{p}",
+            )
+            if key_val:
+                set_api_key(p, key_val)
+                _cached_models.clear()
+        if st.button("🗑️ Clear all keys", key="ai_clear_keys"):
+            clear_all_api_keys()
+            _cached_models.clear()
+            st.rerun()
+
+    status_parts = []
+    for p in providers:
+        lab = provider_info(p)["label"]
+        status_parts.append(f"{'✓' if is_configured(p) else '✗'} {lab}")
+    st.sidebar.caption(" | ".join(status_parts))
+else:
+    Config.AI_ENABLED = False
 
 # Tabs
 tab_single, tab_bulk = st.tabs(["🔍 Single Lookup", "📁 Bulk Import (CSV)"])
@@ -313,12 +378,60 @@ with tab_single:
                         else:
                             st.markdown("*No client portfolio websites extracted*")
 
+                    # Row 5: AI Intelligence (only if available)
+                    ai_enhanced = results.get('ai_enhanced')
+                    ai_approach = results.get('ai_approach')
+                    if ai_enhanced or ai_approach:
+                        st.markdown("---")
+                        st.subheader("✨ AI Intelligence")
+                        with st.container():
+                            if ai_enhanced:
+                                st.markdown(f"**Company Snapshot:** {ai_enhanced.get('summary', '')}")
+                                if ai_enhanced.get('services_grouped'):
+                                    st.markdown("**Services by category:**")
+                                    for category, services in ai_enhanced['services_grouped'].items():
+                                        if services:
+                                            st.markdown(f"- **{category}:** {', '.join(services)}")
+                                if ai_enhanced.get('portfolio_highlights'):
+                                    st.markdown("**Portfolio highlights:**")
+                                    for ph in ai_enhanced['portfolio_highlights'][:5]:
+                                        st.markdown(f"- [{ph['domain']}](http://{ph['domain']}) — {ph.get('description', '')}")
+                                if ai_enhanced.get('key_strengths'):
+                                    st.markdown("**Key strengths:**")
+                                    for s in ai_enhanced['key_strengths']:
+                                        st.markdown(f"- {s}")
+                            if ai_approach:
+                                st.markdown("**🎯 Outreach Strategy**")
+                                st.markdown(f"{ai_approach.get('recap', '')}")
+                                if ai_approach.get('suggested_first_message'):
+                                    st.markdown("**Suggested opener (in Italian):**")
+                                    st.info(ai_approach['suggested_first_message'])
+                                col_a1, col_a2, col_a3 = st.columns(3)
+                                with col_a1:
+                                    st.markdown(f"**Best channel:** {ai_approach.get('best_channel', '?').title()}")
+                                    st.caption(ai_approach.get('best_channel_reason', ''))
+                                with col_a2:
+                                    st.markdown(f"**Tone:** {ai_approach.get('approach_tone', '?').title()}")
+                                with col_a3:
+                                    st.markdown(f"**Angle:** {ai_approach.get('ideal_outreach_angle', '')}")
+                                if ai_approach.get('talking_points'):
+                                    st.markdown("**Talking points:**")
+                                    for tp in ai_approach['talking_points']:
+                                        st.markdown(f"- {tp}")
+                                if ai_approach.get('red_flags'):
+                                    with st.expander("⚠️ Red flags"):
+                                        for rf in ai_approach['red_flags']:
+                                            st.markdown(f"- {rf}")
+                    else:
+                        if Config.AI_ENABLED:
+                            st.markdown("*AI enhancement attempted but no results yet. Check that your API key is valid and the provider supports the selected model.*")
+
                     # Export single report
                     st.markdown("---")
                     st.subheader("Export Report")
                     
-                    # Convert to MD
-                    md_report = f"""# Intelligence Report: {results['official_name'] or search_name}
+                     # Convert to MD
+                    md_parts = [f"""# Intelligence Report: {results['official_name'] or search_name}
 - **Website:** {results['website']}
 - **VAT Number:** {results['vat_number']} (VIES Valid: {results['vies_valid']})
 - **Registered Address:** {results['official_address']}
@@ -342,7 +455,45 @@ with tab_single:
 
 ## Latest News
 {chr(10).join([f"- [{n['title']}]({n['url']}) — {n.get('source','')} {n.get('date','')}" for n in results.get('latest_news', [])])}
-"""
+"""]
+
+                    if ai_enhanced:
+                        md_parts.append(f"""
+## AI Company Profile
+**Summary:** {ai_enhanced.get('summary', '')}
+
+**Profile:** {ai_enhanced.get('company_profile', '')}
+
+**Services by category:**
+{chr(10).join([f"- **{cat}:** {', '.join(svcs)}" for cat, svcs in ai_enhanced.get('services_grouped', {}).items() if svcs])}
+
+**Portfolio highlights:**
+{chr(10).join([f"- [{ph['domain']}](http://{ph['domain']}) — {ph.get('description', '')}" for ph in ai_enhanced.get('portfolio_highlights', [])])}
+
+**Key strengths:**
+{chr(10).join(['- ' + s for s in ai_enhanced.get('key_strengths', [])])}
+""")
+
+                    if ai_approach:
+                        md_parts.append(f"""
+## AI Outreach Strategy
+**Recap:** {ai_approach.get('recap', '')}
+
+**Best channel:** {ai_approach.get('best_channel', '?')}
+**Tone:** {ai_approach.get('approach_tone', '?')}
+**Angle:** {ai_approach.get('ideal_outreach_angle', '')}
+
+**Suggested opener (Italian):**
+{ai_approach.get('suggested_first_message', '')}
+
+**Talking points:**
+{chr(10).join(['- ' + tp for tp in ai_approach.get('talking_points', [])])}
+
+**Red flags:**
+{chr(10).join(['- ' + rf for rf in ai_approach.get('red_flags', [])])}
+""")
+
+                    md_report = "\n".join(md_parts)
                     col_dl1, col_dl2 = st.columns(2)
                     with col_dl1:
                         st.download_button(
@@ -354,7 +505,7 @@ with tab_single:
                     with col_dl2:
                         st.download_button(
                             "Download JSON Data",
-                            data=json.dumps(results, indent=2),
+                            data=json.dumps(redact_keys(results), indent=2),
                             file_name=f"agency_{results['vat_number'] or 'report'}.json",
                             mime="application/json"
                         )

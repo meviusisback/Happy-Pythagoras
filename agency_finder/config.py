@@ -23,6 +23,11 @@ class Config:
     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
     GOOGLE_CX = os.getenv("GOOGLE_CX", "")
 
+    # AI enhancement settings (set by sidebar at runtime)
+    AI_ENABLED = False
+    AI_PROVIDER = ""
+    AI_MODEL = ""
+
     # Default request headers
     @classmethod
     def get_headers(cls):

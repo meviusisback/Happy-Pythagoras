@@ -11,6 +11,9 @@ from .scraper import WebScraper
 from .extractor import InformationExtractor
 from .utils import make_async_client, USER_AGENT, strip_diacritics
 from .news import aexternal_news_lookup
+from .ai_pipeline import aoptimize_search_query, aprocess_full
+from .ai_config import configured_providers
+from .config import Config
 
 logger = logging.getLogger("agency_finder.core")
 
@@ -871,6 +874,14 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
     all_results = []
 
     if query_name:
+        ai_query_task = None
+        if Config.AI_ENABLED and configured_providers():
+            ai_provider = Config.AI_PROVIDER or None
+            ai_model = Config.AI_MODEL or None
+            ai_query_task = asyncio.create_task(
+                aoptimize_search_query(query_name, provider=ai_provider, model=ai_model)
+            )
+
         if progress_cb:
             progress_cb(f"Searching for official website of '{query_name}'...")
         logger.info(f"Website search: {query_name}")
@@ -883,6 +894,17 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
             logger.info(f"VAT search: {query_name}")
             query_b = f'{query_name} partita iva'
             all_results.extend(await asearch_query(query_b, max_results=5))
+
+        if ai_query_task is not None:
+            try:
+                done, _ = await asyncio.wait([ai_query_task], timeout=5)
+                if done:
+                    ai_queries = ai_query_task.result()
+                    for q in ai_queries:
+                        if q and q not in (query_a, query_b):
+                            all_results.extend(await asearch_query(q, max_results=5))
+            except Exception:
+                pass
 
     seen_links = set()
     unique_results = []
@@ -1209,6 +1231,17 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
                             "snippet": snippet,
                             "source": "fallback",
                         })
+
+    if Config.AI_ENABLED and configured_providers():
+        if progress_cb:
+            progress_cb("Running AI enhancement...")
+        logger.info("Starting AI post-extraction enhancement")
+        try:
+            ai_provider = Config.AI_PROVIDER or None
+            ai_model = Config.AI_MODEL or None
+            result = await aprocess_full(result, provider=ai_provider, model=ai_model, timeout=45)
+        except Exception as e:
+            logger.warning(f"AI enhancement failed: {e}")
 
     return result
 
