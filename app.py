@@ -383,7 +383,7 @@ with tab_bulk:
                 completed_count = 0
 
                 async def _process_row(idx, row):
-                    nonlocal completed_count
+                        global completed_count
                     name_val = str(row["name"]).strip() if "name" in cols and pd.notna(row["name"]) else None
                     vat_val = str(row["vat"]).strip() if "vat" in cols and pd.notna(row["vat"]) else None
                     async with semaphore:
