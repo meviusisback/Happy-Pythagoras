@@ -191,6 +191,7 @@ async def achat_json(provider: str, model: str, messages: list, *,
         try:
             return schema.model_validate_json(raw)
         except ValidationError as e:
+            logger.debug(f"{provider} raw response [{schema.__name__}]: {raw[:500]}")
             raise AIError(provider, f"Provider returned invalid JSON: {raw[:100]!r}") from None
 
 
@@ -223,6 +224,7 @@ async def _achat_json_openai(provider: str, model: str, messages: list, *,
         try:
             return schema.model_validate_json(raw)
         except ValidationError as e:
+            logger.debug(f"{provider} raw response [{schema.__name__}]: {raw[:500]}")
             raise AIError(provider, f"Provider returned invalid JSON: {raw[:100]!r}") from None
     except AIError:
         raise
