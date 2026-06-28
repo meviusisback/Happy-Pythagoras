@@ -300,6 +300,23 @@ def _slugify_name(name: str) -> Tuple[str, str]:
     return no_space, hyphen
 
 
+def _clean_agency_name(query: str) -> str:
+    """Strip common search modifiers from a query to get the bare agency name."""
+    modifiers = [
+        "web agency", "agenzia web", "agenzia", "studio", "partita iva", "p.iva", "p. iva",
+        "linkedin", "contatti", "contatto", "italia", "italy", "italian", "italiano",
+        "milano", "milan", "roma", "rome", "torino", "turin", "napoli", "naples",
+        "srl", "s.r.l", "s.r.l.", "spa", "s.p.a", "s.p.a.", "snc", "s.n.c",
+        "digitale", "digital", "comunicazione", "marketing",
+    ]
+    cleaned = query
+    for mod in modifiers:
+        cleaned = re.sub(r"(?i)\b" + re.escape(mod) + r"\b", "", cleaned)
+    cleaned = re.sub(r"[^A-Za-zÀ-ÿ0-9 ]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 def _extract_title(html: str) -> str:
     m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     if m:
@@ -308,28 +325,25 @@ def _extract_title(html: str) -> str:
 
 
 async def _aguess_direct_domains(query: str, max_results: int = 10) -> List[Dict[str, str]]:
-    first_token = query.split()[0] if query else ""
-    name = re.sub(r"[^A-Za-zÀ-ÿ0-9 ]", "", first_token).strip()
+    name = _clean_agency_name(query)
     if len(name) < 3:
         return []
     no_space, hyphen = _slugify_name(name)
     if not no_space:
         return []
-    candidates = [
-        f"https://{no_space}.it",
-        f"https://www.{no_space}.it",
-        f"https://{hyphen}.it",
-        f"https://www.{hyphen}.it",
-        f"https://{no_space}.com",
-        f"https://{hyphen}.com",
-    ]
+    tlds = ["it", "com", "eu", "net", "org", "io"]
+    candidates = []
+    for tld in tlds:
+        for slug in (no_space, hyphen):
+            for prefix in ("", "www."):
+                candidates.append(f"https://{prefix}{slug}.{tld}")
     seen = set()
     for url in candidates:
         if url in seen or not url:
             continue
         seen.add(url)
         try:
-            resp = await _aretry(url, method="GET", timeout=6, max_retries=0)
+            resp = await _aretry(url, method="GET", timeout=5, max_retries=0)
             if resp and resp.status_code == 200 and not _is_captcha(resp.text):
                 title = _extract_title(resp.text) or url
                 return [{"title": title, "link": url, "snippet": "Direct domain guess"}]
@@ -454,6 +468,66 @@ async def _asearch_google_custom(query: str, max_results: int = 10) -> List[Dict
     return []
 
 
+async def _asearch_wikipedia(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+    """Search Italian Wikipedia. No anti-bot, always reachable."""
+    url = "https://it.wikipedia.org/w/api.php"
+    try:
+        response = await _aretry(
+            url,
+            params={
+                "action": "query",
+                "format": "json",
+                "list": "search",
+                "srsearch": query,
+                "srlimit": min(max_results, 10),
+                "srprop": "snippet",
+            },
+            timeout=8,
+            max_retries=0,
+        )
+        if response is None or response.status_code != 200:
+            return []
+        data = response.json()
+        results = []
+        for item in data.get("query", {}).get("search", []):
+            title = item.get("title", "")
+            snippet_html = item.get("snippet", "")
+            snippet = re.sub(r"<[^>]+>", "", snippet_html)
+            snippet = re.sub(r"\s+", " ", snippet).strip()
+            page_url = "https://it.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+            results.append({"title": title, "link": page_url, "snippet": snippet})
+        return results
+    except Exception as e:
+        logger.warning(f"Wikipedia search error: {e}")
+        return []
+
+
+async def _asearch_mojeek(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+    """Search Mojeek (privacy-focused, minimal anti-bot)."""
+    url = "https://www.mojeek.com/search"
+    headers = _rand_headers("google")
+    try:
+        response = await _aretry(url, params={"q": query}, headers=headers, timeout=8, max_retries=0)
+        if response is None or response.status_code != 200:
+            return []
+        soup = BeautifulSoup(response.text, "html.parser")
+        results = []
+        for li in soup.select("li.ob")[:max_results]:
+            title_a = li.select_one("a.title")
+            if not title_a:
+                continue
+            title = title_a.get_text(strip=True)
+            link = title_a.get("href", "")
+            snippet_el = li.select_one("p.s")
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+            if title and link:
+                results.append({"title": title, "link": link, "snippet": snippet})
+        return results
+    except Exception as e:
+        logger.warning(f"Mojeek search error: {e}")
+        return []
+
+
 async def asearch_query(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     global last_search_error
     last_search_error = None
@@ -474,7 +548,9 @@ async def asearch_query(query: str, max_results: int = 10) -> List[Dict[str, str
     tasks.append(asyncio.create_task(_asearch_duckduckgo(query, max_results)))
     tasks.append(asyncio.create_task(_asearch_ddg_lite(query, max_results)))
     tasks.append(asyncio.create_task(_asearch_ddg_html(query, max_results)))
+    tasks.append(asyncio.create_task(_asearch_mojeek(query, max_results)))
     tasks.append(asyncio.create_task(_asearch_bing_html(query, max_results)))
+    tasks.append(asyncio.create_task(_asearch_wikipedia(query, max_results)))
     tasks.append(asyncio.create_task(_aguess_direct_domains(query, max_results)))
 
     try:

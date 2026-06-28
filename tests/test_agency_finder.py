@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 import xml.etree.ElementTree as ET
@@ -950,9 +951,11 @@ class TestSearchOuterTimeout(unittest.TestCase):
     @patch("agency_finder.search._asearch_duckduckgo", new_callable=AsyncMock)
     @patch("agency_finder.search._asearch_ddg_lite", new_callable=AsyncMock)
     @patch("agency_finder.search._asearch_ddg_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_mojeek", new_callable=AsyncMock)
     @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_wikipedia", new_callable=AsyncMock)
     @patch("agency_finder.search._aguess_direct_domains", new_callable=AsyncMock)
-    def test_asearch_completes_within_timeout(self, mock_guess, mock_bing, mock_html, mock_lite, mock_ddg):
+    def test_asearch_completes_within_timeout(self, mock_guess, mock_wiki, mock_bing, mock_mojeek, mock_html, mock_lite, mock_ddg):
         import asyncio
         async def _slow(*a, **kw):
             await asyncio.sleep(200)
@@ -960,7 +963,9 @@ class TestSearchOuterTimeout(unittest.TestCase):
         mock_ddg.side_effect = _slow
         mock_lite.side_effect = _slow
         mock_html.side_effect = _slow
+        mock_mojeek.side_effect = _slow
         mock_bing.side_effect = _slow
+        mock_wiki.side_effect = _slow
         mock_guess.side_effect = _slow
         from agency_finder.search import asearch_query
         import time
@@ -971,8 +976,13 @@ class TestSearchOuterTimeout(unittest.TestCase):
         self.assertLess(elapsed, 20)
 
     @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_wikipedia", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_mojeek", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_ddg_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_ddg_lite", new_callable=AsyncMock)
     @patch("agency_finder.search._asearch_duckduckgo", new_callable=AsyncMock)
-    def test_returns_cached_result_immediately(self, mock_ddg, mock_bing):
+    @patch("agency_finder.search._aguess_direct_domains", new_callable=AsyncMock)
+    def test_returns_cached_result_immediately(self, mock_guess, mock_ddg, mock_lite, mock_html, mock_mojeek, mock_wiki, mock_bing):
         import asyncio
         from agency_finder.search import _cache_set
         _cache_set("cached_query", 5, [{"title": "cached", "link": "http://x", "snippet": ""}])
@@ -1144,21 +1154,27 @@ class TestSearchRobustness(unittest.TestCase):
     @patch("agency_finder.search._asearch_duckduckgo", new_callable=AsyncMock)
     @patch("agency_finder.search._asearch_ddg_lite", new_callable=AsyncMock)
     @patch("agency_finder.search._asearch_ddg_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_mojeek", new_callable=AsyncMock)
     @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_wikipedia", new_callable=AsyncMock)
     @patch("agency_finder.search._aguess_direct_domains", new_callable=AsyncMock)
-    def test_asearch_query_launches_all_backends(self, mock_guess, mock_bing, mock_html, mock_lite, mock_ddg):
+    def test_asearch_query_launches_all_backends(self, mock_guess, mock_wiki, mock_bing, mock_mojeek, mock_html, mock_lite, mock_ddg):
         from agency_finder.search import asearch_query
         mock_ddg.return_value = [{"title": "x", "link": "y", "snippet": ""}]
         mock_lite.return_value = []
         mock_html.return_value = []
+        mock_mojeek.return_value = []
         mock_bing.return_value = []
+        mock_wiki.return_value = []
         mock_guess.return_value = []
         result = asyncio.run(asearch_query("test query", 3))
         self.assertGreater(len(result), 0)
         mock_ddg.assert_called_once()
         mock_lite.assert_called_once()
         mock_html.assert_called_once()
+        mock_mojeek.assert_called_once()
         mock_bing.assert_called_once()
+        mock_wiki.assert_called_once()
         mock_guess.assert_called_once()
 
     @patch("agency_finder.search.DDGS")
@@ -1278,6 +1294,79 @@ class TestSearchRobustness(unittest.TestCase):
         no_space2, hyphen2 = _slugify_name("Web&Co")
         self.assertEqual(no_space2, "webco")
         self.assertEqual(hyphen2, "web-co")
+
+    def test_clean_agency_name(self):
+        from agency_finder.search import _clean_agency_name
+        self.assertEqual(_clean_agency_name("Cantiere Creativo web agency"), "Cantiere Creativo")
+        self.assertEqual(_clean_agency_name("Hostinato partita iva"), "Hostinato")
+        self.assertEqual(_clean_agency_name("Acme SRL Milano"), "Acme")
+        self.assertEqual(_clean_agency_name("Web&Co"), "Web Co")
+
+    @patch("agency_finder.search._aretry")
+    def test_asearch_wikipedia_returns_results(self, mock_aretry):
+        from agency_finder.search import _asearch_wikipedia
+        api_response = {
+            "query": {
+                "search": [
+                    {"title": "Cantiere Creativo", "snippet": "A <span>creative</span> agency in Milan."}
+                ]
+            }
+        }
+        mock_response = MagicMock(status_code=200, text=json.dumps(api_response))
+        mock_response.json.return_value = api_response
+        mock_aretry.return_value = mock_response
+        result = asyncio.run(_asearch_wikipedia("Cantiere Creativo", 5))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["title"], "Cantiere Creativo")
+        self.assertIn("creative agency", result[0]["snippet"])
+        self.assertIn("wikipedia.org", result[0]["link"])
+
+    @patch("agency_finder.search._aretry")
+    def test_asearch_wikipedia_handles_empty(self, mock_aretry):
+        from agency_finder.search import _asearch_wikipedia
+        api_response = {"query": {"search": []}}
+        mock_response = MagicMock(status_code=200, text=json.dumps(api_response))
+        mock_response.json.return_value = api_response
+        mock_aretry.return_value = mock_response
+        result = asyncio.run(_asearch_wikipedia("xyznotfound", 5))
+        self.assertEqual(result, [])
+
+    @patch("agency_finder.search._aretry")
+    def test_asearch_mojeek_returns_results(self, mock_aretry):
+        from agency_finder.search import _asearch_mojeek
+        html = """
+        <html><body>
+        <ul class="results-standard">
+          <li class="ob">
+            <a class="title" href="https://example.com">Example Title</a>
+            <p class="s">An example snippet.</p>
+          </li>
+        </ul>
+        </body></html>
+        """
+        mock_aretry.return_value = MagicMock(status_code=200, text=html)
+        result = asyncio.run(_asearch_mojeek("example", 5))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["title"], "Example Title")
+        self.assertEqual(result[0]["link"], "https://example.com")
+        self.assertEqual(result[0]["snippet"], "An example snippet.")
+
+    @patch("agency_finder.search._aretry")
+    def test_asearch_mojeek_handles_empty(self, mock_aretry):
+        from agency_finder.search import _asearch_mojeek
+        mock_aretry.return_value = MagicMock(status_code=200, text="<html><body></body></html>")
+        result = asyncio.run(_asearch_mojeek("xyznotfound", 5))
+        self.assertEqual(result, [])
+
+    @patch("agency_finder.search._aretry")
+    def test_direct_domain_guess_uses_full_name(self, mock_aretry):
+        from agency_finder.search import _aguess_direct_domains
+        mock_aretry.return_value = MagicMock(status_code=404, text="not found")
+        asyncio.run(_aguess_direct_domains("Cantiere Creativo web agency Milano"))
+        called_urls = [call.args[0] for call in mock_aretry.call_args_list]
+        self.assertTrue(any("cantierecreativo" in u for u in called_urls))
+        self.assertTrue(any("cantiere-creativo" in u for u in called_urls))
+        self.assertFalse(any("milano" in u.lower() for u in called_urls))
 
 
 if __name__ == "__main__":
