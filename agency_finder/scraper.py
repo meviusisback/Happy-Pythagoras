@@ -77,7 +77,12 @@ class WebScraper:
             page_type = "contact"
         elif any(k in path for k in ["serviz", "cosa-facciam", "skills", "soluzion", "competenz", "services"]):
             page_type = "services"
-        elif any(k in path for k in ["portfolio", "progett", "lavori", "cases", "works", "clienti"]):
+        elif any(k in path for k in [
+            "portfolio", "progett", "lavori", "cases", "case-stud", "case_stud",
+            "works", "clienti", "client", "customers", "showcase",
+            "referenz", "realizzazion", "our-work", "recent-work",
+            "success", "stories", "testimon", "custom",
+        ]):
             page_type = "portfolio"
         elif any(k in path for k in ["privacy", "cookie", "legal", "note-legal"]):
             page_type = "legal"
@@ -156,7 +161,11 @@ class WebScraper:
                 path = urlparse(link).path.lower()
                 is_priority = any(k in path for k in [
                     "contact", "contatt", "serviz", "cosa-facciam", "skills",
-                    "portfolio", "progett", "lavori", "cases", "works", "chi-siam", "about",
+                    "portfolio", "progett", "lavori", "cases", "case-stud", "case_stud",
+                    "works", "clienti", "client", "customers", "showcase",
+                    "referenz", "realizzazion", "our-work", "recent-work",
+                    "success", "stories", "testimon",
+                    "chi-siam", "about",
                 ])
                 if is_priority:
                     priority_links.append(link)

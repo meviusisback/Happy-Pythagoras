@@ -3,7 +3,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import xml.etree.ElementTree as ET
 from agency_finder.vies import check_vat, acheck_vat
 from agency_finder.scraper import WebScraper
-from agency_finder.extractor import InformationExtractor
+from agency_finder.extractor import InformationExtractor, _decode_cfemail, _deobfuscate_email
 from agency_finder.core import find_linkedin_employees, scrape_linkedin_company_page
 
 
@@ -313,6 +313,221 @@ class TestScrapeLinkedInCompanyPage(unittest.TestCase):
         MockClient.return_value = mock_client
         results = scrape_linkedin_company_page("https://linkedin.com/company/acme", max_results=10)
         self.assertEqual(len(results), 10)
+
+
+class TestCfemailDecoding(unittest.TestCase):
+    def test_basic_decode(self):
+        # "test@example.com": key=0x74('t'), each subsequent byte XOR'd with key
+        # Encodes as: 0x74 0x00 0x11 0x07 0x00 0x34 0x11 0x0c 0x15 0x19 0x04 0x18 0x11 0x5a 0x17 0x1b 0x19
+        encoded = "740011070034110c15190418115a171b19"
+        decoded = _decode_cfemail(encoded)
+        self.assertEqual(decoded, "test@example.com")
+
+    def test_invalid_hex_returns_empty(self):
+        self.assertEqual(_decode_cfemail("zzzz"), "")
+
+    def test_empty_returns_empty(self):
+        self.assertEqual(_decode_cfemail(""), "")
+
+
+class TestDeobfuscateEmail(unittest.TestCase):
+    def test_bracket_at(self):
+        self.assertEqual(_deobfuscate_email("name[at]domain.com"), "name@domain.com")
+
+    def test_paren_at(self):
+        self.assertEqual(_deobfuscate_email("name(at)domain.com"), "name@domain.com")
+
+    def test_dot_bracket(self):
+        self.assertEqual(_deobfuscate_email("name[at]domain[dot]com"), "name@domain.com")
+
+    def test_italian_chiocciola(self):
+        self.assertEqual(_deobfuscate_email("name chiocciola domain punto it"), "name@domain.it")
+
+    def test_already_clean(self):
+        self.assertEqual(_deobfuscate_email("info@agency.it"), "info@agency.it")
+
+
+class TestExtractorEmailHtml(unittest.TestCase):
+    def test_mailto_href(self):
+        pages = [{
+            "url": "https://agency.it/contatti",
+            "type": "contact",
+            "text": "Contact us",
+            "html": '<a href="mailto:info@agency.it">Email us</a>',
+            "external_links": [],
+        }]
+        ext = InformationExtractor(pages)
+        emails = ext.extract_emails()
+        self.assertIn("info@agency.it", emails)
+
+    def test_data_mail_attr(self):
+        pages = [{
+            "url": "https://agency.it",
+            "type": "generic",
+            "text": "No email in text",
+            "html": '<span data-mail="contact@agency.it">Contact</span>',
+            "external_links": [],
+        }]
+        ext = InformationExtractor(pages)
+        emails = ext.extract_emails()
+        self.assertIn("contact@agency.it", emails)
+
+    def test_cfemail_decode(self):
+        # Encode "hi@agency.it": key='h'=0x68, each subsequent char XOR'd with 0x68
+        pages = [{
+            "url": "https://agency.it",
+            "type": "generic",
+            "text": "No email here",
+            "html": '<a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="68000128090f0d060b1146011c">[email&#160;protected]</a>',
+            "external_links": [],
+        }]
+        ext = InformationExtractor(pages)
+        emails = ext.extract_emails()
+        self.assertIn("hi@agency.it", emails)
+
+    def test_obfuscated_in_text(self):
+        pages = [{
+            "url": "https://agency.it",
+            "type": "generic",
+            "text": "Scrivici a name [at] agency [dot] it per info.",
+            "html": "",
+            "external_links": [],
+        }]
+        ext = InformationExtractor(pages)
+        emails = ext.extract_emails()
+        self.assertIn("name@agency.it", emails)
+
+    def test_excludes_noreply(self):
+        pages = [{
+            "url": "https://agency.it",
+            "type": "generic",
+            "text": "noreply@agency.it and info@agency.it",
+            "html": "",
+            "external_links": [],
+        }]
+        ext = InformationExtractor(pages)
+        emails = ext.extract_emails()
+        self.assertNotIn("noreply@agency.it", emails)
+        self.assertIn("info@agency.it", emails)
+
+
+class TestPaymentIntegrationsExpanded(unittest.TestCase):
+    def setUp(self):
+        self.pages = [{
+            "url": "https://agency.it",
+            "type": "services",
+            "text": "Offriamo integrazioni con Scalapay, Banca Sella GestPay e Worldline.",
+            "html": "",
+            "external_links": [],
+        }]
+
+    def test_scalapay_detected(self):
+        ext = InformationExtractor(self.pages)
+        result = ext.extract_payment_integrations()
+        self.assertTrue(result["provides_payment_integration"])
+        self.assertIn("Scalapay (Buy Now Pay Later)", result["payment_providers"])
+
+    def test_banca_sella_detected(self):
+        ext = InformationExtractor(self.pages)
+        result = ext.extract_payment_integrations()
+        self.assertIn("Banca Sella / GestPay", result["payment_providers"])
+
+    def test_worldline_detected(self):
+        ext = InformationExtractor(self.pages)
+        result = ext.extract_payment_integrations()
+        self.assertIn("Worldline", result["payment_providers"])
+
+    def test_logo_img_detection(self):
+        pages = [{
+            "url": "https://agency.it",
+            "type": "services",
+            "text": "Payment methods we support:",
+            "html": '<img src="/images/payments/stripe-logo.png" alt="Stripe"><img src="/images/payments/pal.png" alt="PayPal">',
+            "external_links": [],
+        }]
+        ext = InformationExtractor(pages)
+        result = ext.extract_payment_integrations()
+        self.assertTrue(result["provides_payment_integration"])
+        self.assertIn("Stripe", result["payment_providers"])
+        self.assertIn("PayPal", result["payment_providers"])
+
+    def test_new_platforms(self):
+        pages = [{
+            "url": "https://agency.it",
+            "type": "services",
+            "text": "Sviluppiamo su Shopware e VTEX.",
+            "html": "",
+            "external_links": [],
+        }]
+        ext = InformationExtractor(pages)
+        result = ext.extract_payment_integrations()
+        self.assertIn("Shopware", result["associated_services"])
+        self.assertIn("VTEX", result["associated_services"])
+
+
+class TestScraperPortfolioKeywords(unittest.TestCase):
+    def test_case_study_recognized(self):
+        scraper = WebScraper("https://example.com")
+        from bs4 import BeautifulSoup
+        html = '<html><body><a href="/case-studies/client-x">Case Study</a></body></html>'
+        soup = BeautifulSoup(html, "html.parser")
+        links = scraper.get_internal_links(soup, "https://example.com")
+        self.assertEqual(len(links), 1)
+
+    def test_customers_recognized(self):
+        scraper = WebScraper("https://example.com")
+        from bs4 import BeautifulSoup
+        html = '<html><body><a href="/customers">Our Customers</a></body></html>'
+        soup = BeautifulSoup(html, "html.parser")
+        links = scraper.get_internal_links(soup, "https://example.com")
+        self.assertEqual(len(links), 1)
+
+    def test_realizzazioni_recognized(self):
+        scraper = WebScraper("https://example.com")
+        from bs4 import BeautifulSoup
+        html = '<html><body><a href="/realizzazioni">Progetti</a></body></html>'
+        soup = BeautifulSoup(html, "html.parser")
+        links = scraper.get_internal_links(soup, "https://example.com")
+        self.assertEqual(len(links), 1)
+
+
+class TestExternalPortfolioLookup(unittest.TestCase):
+
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_clutch_profile_extracts_client_links(self, MockClient, mock_search):
+        # Mock DDG search returning a Clutch profile
+        mock_search.return_value = [
+            {"title": "Cantiere Creativo su Clutch", "link": "https://clutch.co/profile/cantiere-creativo", "snippet": "..."}
+        ]
+        # Mock the Clutch profile page HTML
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = '<html><body><a href="https://client-x.com">Client X</a><a href="https://clutch.co/other">Other</a></body></html>'
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
+
+        from agency_finder.core import aexternal_portfolio_lookup
+        import asyncio
+        results = asyncio.run(aexternal_portfolio_lookup("Cantiere Creativo"))
+        domains = [c["domain"] for c in results]
+        self.assertIn("client-x.com", domains)
+        self.assertIn("clutch.co", [c["source"] for c in results])
+
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
+    def test_generic_portfolio_search(self, mock_search):
+        mock_search.return_value = [
+            {"title": "Progetto realizzato per Cantiere Creativo", "link": "https://some-agency-showcase.it/portfolio", "snippet": "..."}
+        ]
+        from agency_finder.core import _afetch_generic_portfolio
+        import asyncio
+        results = asyncio.run(_afetch_generic_portfolio("Cantiere Creativo"))
+        domains = [c["domain"] for c in results]
+        self.assertIn("some-agency-showcase.it", domains)
+        self.assertEqual(results[0]["source"], "generic_search")
 
 
 if __name__ == "__main__":

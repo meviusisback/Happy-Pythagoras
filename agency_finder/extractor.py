@@ -1,18 +1,34 @@
 import re
 from urllib.parse import urlparse
-from typing import List, Dict, Set, Any
+from typing import List, Dict, Set, Any, Tuple
 from bs4 import BeautifulSoup
 
 _PROVIDER_PATTERN = re.compile(
-    r'\b(stripe|paypal|satispay|nexi|klarna|adyen|braintree|apple pay|google pay|amazon pay|shopify payments)\b',
+    r'\b(stripe|paypal|satispay|nexi|klarna|adyen|braintree|apple pay|google pay|amazon pay|shopify payments|'
+    r'scalapay|sisalpay|banca sella|gestpay|xpay|unicredit|cherrypay|cofidis|findomestic|'
+    r'worldline|concardis|axepta|mybank|bancomat pay|sumup|credem|bper|pagopa|'
+    r'ideal|sofort|trustly|mollie|checkout\.com|2checkout|verifone|payoneer|payu|'
+    r'razorpay|square|worldpay|windcave|coinbase|bitpay|'
+    r'visa|mastercard|american express|pos virtuale)\b',
     re.IGNORECASE,
 )
 _PLATFORM_PATTERN = re.compile(
-    r'\b(shopify|woocommerce|magento|prestashop|custom e-commerce)\b',
+    r'\b(shopify|woocommerce|magento|prestashop|shopware|bigcommerce|'
+    r'salesforce commerce cloud|demandware|wix|squarespace|'
+    r'drupal commerce|opencart|oscommerce|lightspeed|vtex|custom e-commerce)\b',
     re.IGNORECASE,
 )
 _PAYMENT_TERMS_PATTERN = re.compile(
     r'\b(gateway di pagamento|sistemi di pagamento|integrazione pagamenti|pagamenti online|pos virtuale)\b',
+    re.IGNORECASE,
+)
+_LOGO_IMG_PATTERN = re.compile(
+    r'<img\s+[^>]*(?:alt|src)=["\']([^"\']*)["\'][^>]*>',
+    re.IGNORECASE,
+)
+_JS_PAYMENT_PATTERN = re.compile(
+    r'(?:Stripe\.setPublishableKey|braintree\.setup|paypal\.Button\.render|Stripe\(|'
+    r'Braintree\.create|Mollie\(|Checkout\.com)',
     re.IGNORECASE,
 )
 
@@ -28,6 +44,43 @@ _PROVIDER_TO_NAME = {
     "google pay": "Google Pay",
     "amazon pay": "Amazon Pay",
     "shopify payments": "Shopify Payments",
+    "scalapay": "Scalapay (Buy Now Pay Later)",
+    "sisalpay": "SisalPay",
+    "banca sella": "Banca Sella / GestPay",
+    "gestpay": "Banca Sella / GestPay",
+    "xpay": "XPay",
+    "unicredit": "UniCredit",
+    "cherrypay": "CherryPay",
+    "cofidis": "Cofidis",
+    "findomestic": "Findomestic",
+    "worldline": "Worldline",
+    "concardis": "Concardis / Worldline",
+    "axepta": "Axepta (BNL)",
+    "mybank": "MyBank",
+    "bancomat pay": "Bancomat Pay",
+    "sumup": "SumUp",
+    "credem": "Credem",
+    "bper": "BPER",
+    "pagopa": "PagoPA",
+    "ideal": "iDEAL",
+    "sofort": "Sofort (Klarna)",
+    "trustly": "Trustly",
+    "mollie": "Mollie",
+    "checkout.com": "Checkout.com",
+    "2checkout": "2Checkout / Verifone",
+    "verifone": "2Checkout / Verifone",
+    "payoneer": "Payoneer",
+    "payu": "PayU",
+    "razorpay": "Razorpay",
+    "square": "Square",
+    "worldpay": "Worldpay",
+    "windcave": "Windcave",
+    "coinbase": "Coinbase Commerce",
+    "bitpay": "BitPay",
+    "visa": "Visa",
+    "mastercard": "Mastercard",
+    "american express": "American Express",
+    "pos virtuale": "POS Virtuale",
 }
 
 _PLATFORM_TO_NAME = {
@@ -35,14 +88,50 @@ _PLATFORM_TO_NAME = {
     "woocommerce": "WooCommerce (WordPress)",
     "magento": "Adobe Commerce (Magento)",
     "prestashop": "PrestaShop",
+    "shopware": "Shopware",
+    "bigcommerce": "BigCommerce",
+    "salesforce commerce cloud": "Salesforce Commerce Cloud",
+    "demandware": "Salesforce Commerce Cloud",
+    "wix": "Wix",
+    "squarespace": "Squarespace",
+    "drupal commerce": "Drupal Commerce",
+    "opencart": "OpenCart",
+    "oscommerce": "osCommerce",
+    "lightspeed": "Lightspeed",
+    "vtex": "VTEX",
     "custom e-commerce": "Sviluppo E-commerce Custom",
 }
+
+
+def _decode_cfemail(hex_str: str) -> str:
+    """Decode Cloudflare email obfuscation (data-cfemail)."""
+    try:
+        raw = bytes.fromhex(hex_str)
+        if len(raw) < 2:
+            return ""
+        key = raw[0]
+        return "".join(chr(b ^ key) for b in raw[1:])
+    except Exception:
+        return ""
+
+
+def _deobfuscate_email(email: str) -> str:
+    """De-obfuscate common email obfuscation patterns."""
+    result = email
+    result = re.sub(r"\s*\[\s*at\s*\]\s*", "@", result, flags=re.IGNORECASE)
+    result = re.sub(r"\s*\(\s*at\s*\)\s*", "@", result, flags=re.IGNORECASE)
+    result = re.sub(r"\s*\[\s*dot\s*\]\s*", ".", result, flags=re.IGNORECASE)
+    result = re.sub(r"\s*\(\s*dot\s*\)\s*", ".", result, flags=re.IGNORECASE)
+    result = re.sub(r"\s+chiocciola\s+", "@", result, flags=re.IGNORECASE)
+    result = re.sub(r"\s+punto\s+", ".", result, flags=re.IGNORECASE)
+    result = re.sub(r"\s+at\s+", "@", result, flags=re.IGNORECASE)
+    return result
 
 class InformationExtractor:
     def __init__(self, scraped_pages: List[Dict[str, Any]]):
         self.pages = scraped_pages
-        # Combine all texts for global search
         self.all_text = "\n".join([page.get("text", "") for page in self.pages])
+        self.all_html = "\n".join([page.get("html", "") for page in self.pages])
 
     def extract_vat(self) -> str:
         """
@@ -88,24 +177,54 @@ class InformationExtractor:
         return ""
 
     def extract_emails(self) -> List[str]:
-        """Extracts unique public email addresses."""
-        email_regex = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
-        emails = re.findall(email_regex, self.all_text)
-        
-        # Filter out common dummy or automated email addresses
-        ignore_emails = {
-            "sentry.io", "w3.org", "example.com", "yourdomain.com", "email@example.com",
-            "name@domain.com", "domain.com", "bootstrap.com"
-        }
-        
-        valid_emails = set()
-        for email in emails:
-            email_lower = email.lower()
-            domain = email_lower.split("@")[-1] if "@" in email_lower else ""
-            if domain not in ignore_emails and email_lower not in ignore_emails:
-                valid_emails.add(email_lower)
-                
-        return sorted(list(valid_emails))
+        """Extracts unique public email addresses from text and HTML."""
+        email_regex = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+
+        raw_sources = [self.all_text]
+        if self.all_html:
+            raw_sources.append(self.all_html)
+
+        found = set()
+
+        for source in raw_sources:
+            for m in re.finditer(email_regex, source):
+                found.add(m.group(0).lower())
+
+        for m in re.finditer(r"mailto:([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", self.all_html):
+            found.add(m.group(1).lower())
+
+        for m in re.finditer(r'data-[a-z]*mail["\s:=]+["\']?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})', self.all_html, re.IGNORECASE):
+            found.add(m.group(1).lower())
+
+        for m in re.finditer(r'data-cfemail["\s:=]+["\']([0-9a-fA-F]+)', self.all_html):
+            decoded = _decode_cfemail(m.group(1))
+            if decoded and "@" in decoded:
+                found.add(decoded.lower())
+
+        for m in re.finditer(r'__cf_email__[^>]*data-cfemail="([0-9a-fA-F]+)"', self.all_html):
+            decoded = _decode_cfemail(m.group(1))
+            if decoded and "@" in decoded:
+                found.add(decoded.lower())
+
+        for source in raw_sources:
+            deobf = _deobfuscate_email(source)
+            for m in re.finditer(email_regex, deobf):
+                found.add(m.group(0).lower())
+
+        ignore_patterns = {"sentry.io", "w3.org", "example.com", "yourdomain.com",
+                           "domain.com", "bootstrap.com", "schema.org"}
+        role_prefixes = ("noreply@", "no-reply@", "postmaster@", "root@", "abuse@", "webmaster@")
+
+        valid = set()
+        for email in found:
+            domain = email.split("@")[-1] if "@" in email else ""
+            if domain in ignore_patterns:
+                continue
+            if any(email.startswith(p) for p in role_prefixes):
+                continue
+            valid.add(email)
+
+        return sorted(list(valid))
 
     def extract_telephones(self) -> List[str]:
         """Extracts unique public Italian telephone numbers."""
@@ -273,9 +392,22 @@ class InformationExtractor:
         and lists the specific providers or services mentioned.
         """
         text_lower = self.all_text.lower()
+        html_lower = self.all_html.lower()
 
         detected_providers = {_PROVIDER_TO_NAME[m.group(0).lower()] for m in _PROVIDER_PATTERN.finditer(text_lower)}
         detected_platforms = {_PLATFORM_TO_NAME[m.group(0).lower()] for m in _PLATFORM_PATTERN.finditer(text_lower)}
+
+        for m in _LOGO_IMG_PATTERN.finditer(self.all_html):
+            alt_src = m.group(1).lower()
+            for prov_key in _PROVIDER_TO_NAME:
+                if prov_key in alt_src:
+                    detected_providers.add(_PROVIDER_TO_NAME[prov_key])
+
+        if _JS_PAYMENT_PATTERN.search(html_lower):
+            for prov_key in ("stripe", "braintree", "paypal", "mollie", "checkout.com"):
+                if prov_key in html_lower:
+                    detected_providers.add(_PROVIDER_TO_NAME[prov_key])
+
         has_general_payment_mentions = bool(_PAYMENT_TERMS_PATTERN.search(text_lower))
 
         provides_integration = len(detected_providers) > 0 or len(detected_platforms) > 0 or has_general_payment_mentions

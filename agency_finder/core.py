@@ -396,6 +396,202 @@ def find_linkedin_employees(
     return asyncio.run(afind_linkedin_employees(query_name, linkedin_company_url, website_domain, max_results))
 
 
+_IGNORE_DOMAINS_SET = set(IGNORE_DOMAINS) | {
+    "clutch.co", "designrush.com", "themanifest.com", "upcity.com",
+    "goodfirms.co", "sortlist.it", "sortlist.com", "europages.com",
+    "behance.net", "dribbble.com",
+}
+
+
+async def _afetch_clutch_profile(agency_name: str, progress_cb=None) -> List[Dict[str, str]]:
+    """Search Clutch.co for the agency and extract client/portfolio info."""
+    results = await asearch_query(f'site:clutch.co "{agency_name}"', max_results=3)
+    clients = []
+    for r in results:
+        link = r.get("link", "")
+        if "clutch.co" not in link:
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+                resp = await client.get(link, headers={"User-Agent": USER_AGENT})
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for tag in soup.find_all("a", href=True):
+                href = tag["href"]
+                parsed = urlparse(href)
+                if parsed.netloc and not any(
+                    parsed.netloc == d or parsed.netloc.endswith("." + d) for d in _IGNORE_DOMAINS_SET
+                ):
+                    clean_domain = parsed.netloc.lower()
+                    clean_domain = clean_domain[4:] if clean_domain.startswith("www.") else clean_domain
+                    clients.append({
+                        "domain": clean_domain,
+                        "url": f"{parsed.scheme}://{parsed.netloc}",
+                        "source": "clutch.co",
+                    })
+        except Exception as e:
+            logger.debug(f"Clutch profile fetch failed ({link}): {e}")
+    return clients
+
+
+async def _afetch_behance_portfolio(agency_name: str, progress_cb=None) -> List[Dict[str, str]]:
+    """Search Behance for the agency's projects and extract linked client sites."""
+    results = await asearch_query(f'site:behance.net "{agency_name}"', max_results=3)
+    clients = []
+    for r in results:
+        link = r.get("link", "")
+        if "behance.net" not in link:
+            continue
+        snippet = r.get("snippet", "") + " " + r.get("title", "")
+        for m in re.finditer(r'https?://[^\s<>"]+', snippet):
+            url = m.group(0)
+            parsed = urlparse(url)
+            if parsed.netloc and not any(
+                parsed.netloc == d or parsed.netloc.endswith("." + d) for d in _IGNORE_DOMAINS_SET
+            ):
+                clean_domain = parsed.netloc.lower()
+                clean_domain = clean_domain[4:] if clean_domain.startswith("www.") else clean_domain
+                clients.append({
+                    "domain": clean_domain,
+                    "url": url,
+                    "source": "behance.net",
+                })
+    return clients
+
+
+async def _afetch_dribbble_portfolio(agency_name: str, progress_cb=None) -> List[Dict[str, str]]:
+    """Search Dribbble for the agency's projects and extract linked client sites."""
+    results = await asearch_query(f'site:dribbble.com "{agency_name}"', max_results=3)
+    clients = []
+    for r in results:
+        link = r.get("link", "")
+        if "dribbble.com" not in link:
+            continue
+        snippet = r.get("snippet", "") + " " + r.get("title", "")
+        for m in re.finditer(r'https?://[^\s<>"]+', snippet):
+            url = m.group(0)
+            parsed = urlparse(url)
+            if parsed.netloc and not any(
+                parsed.netloc == d or parsed.netloc.endswith("." + d) for d in _IGNORE_DOMAINS_SET
+            ):
+                clean_domain = parsed.netloc.lower()
+                clean_domain = clean_domain[4:] if clean_domain.startswith("www.") else clean_domain
+                clients.append({
+                    "domain": clean_domain,
+                    "url": url,
+                    "source": "dribbble.com",
+                })
+    return clients
+
+
+async def _afetch_linkedin_case_studies(
+    linkedin_company_url: str, progress_cb=None,
+) -> List[Dict[str, str]]:
+    """Scrape the LinkedIn company page for case-study / featured-post external links."""
+    if not linkedin_company_url:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(linkedin_company_url, headers=_LINKEDIN_HEADERS)
+        if resp.status_code != 200:
+            return []
+        lower = resp.text.lower()
+        if any(s in lower for s in ("captcha", "verify you are human", "sign in")):
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        clients = []
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
+            parsed = urlparse(href)
+            if parsed.netloc and not any(
+                parsed.netloc == d or parsed.netloc.endswith("." + d) for d in _IGNORE_DOMAINS_SET
+            ):
+                clean_domain = parsed.netloc.lower()
+                clean_domain = clean_domain[4:] if clean_domain.startswith("www.") else clean_domain
+                clients.append({
+                    "domain": clean_domain,
+                    "url": href,
+                    "source": "linkedin.com",
+                })
+        return clients
+    except Exception as e:
+        logger.debug(f"LinkedIn case study fetch failed: {e}")
+        return []
+
+
+async def _afetch_generic_portfolio(agency_name: str, progress_cb=None) -> List[Dict[str, str]]:
+    """Broad DDG search for portfolio / case-study mentions of the agency."""
+    queries = [
+        f'"{agency_name}" "realizzato per" OR "case study" OR "portfolio" OR "clienti"',
+        f'"{agency_name}" "progetto realizzato" OR "client" OR "progetti"',
+    ]
+    clients = []
+    seen_domains = set()
+    for q in queries:
+        try:
+            results = await asearch_query(q, max_results=5)
+        except Exception:
+            continue
+        for r in results:
+            link = r.get("link", "")
+            parsed = urlparse(link)
+            if not parsed.netloc:
+                continue
+            clean_domain = parsed.netloc.lower()
+            clean_domain = clean_domain[4:] if clean_domain.startswith("www.") else clean_domain
+            if clean_domain in seen_domains:
+                continue
+            is_ignored = any(
+                clean_domain == d or clean_domain.endswith("." + d) for d in _IGNORE_DOMAINS_SET
+            )
+            if is_ignored:
+                continue
+            seen_domains.add(clean_domain)
+            clients.append({
+                "domain": clean_domain,
+                "url": f"{parsed.scheme}://{parsed.netloc}",
+                "source": "generic_search",
+            })
+    return clients
+
+
+async def aexternal_portfolio_lookup(
+    agency_name: str,
+    linkedin_company_url: str = "",
+    progress_cb=None,
+) -> List[Dict[str, str]]:
+    """
+    Fetch agency portfolio/client lists from external sources in parallel.
+    Returns a list of dicts with keys: domain, url, source.
+    """
+    if not agency_name:
+        return []
+
+    tasks = [
+        _afetch_clutch_profile(agency_name, progress_cb),
+        _afetch_behance_portfolio(agency_name, progress_cb),
+        _afetch_dribbble_portfolio(agency_name, progress_cb),
+        _afetch_linkedin_case_studies(linkedin_company_url, progress_cb),
+        _afetch_generic_portfolio(agency_name, progress_cb),
+    ]
+
+    results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+    seen = set()
+    merged = []
+    for res in results_list:
+        if isinstance(res, Exception):
+            continue
+        for item in res:
+            domain = item["domain"]
+            if domain not in seen:
+                seen.add(domain)
+                merged.append(item)
+
+    return merged
+
+
 async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progress_cb=None) -> Dict[str, Any]:
     if not name and not vat:
         return {"error": "Provide at least a company name or a VAT number."}
@@ -421,6 +617,7 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
             "associated_services": []
         },
         "portfolio_sites": [],
+        "portfolio_detail": [],
         "linkedin_contacts": [],
         "linkedin_company_url": ""
     }
@@ -626,6 +823,14 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
     if not urls_to_try and result["website"]:
         urls_to_try.append(result["website"])
 
+    external_portfolio_task = None
+    if query_name:
+        if progress_cb:
+            progress_cb("Searching external sources for portfolio/client sites (Clutch, Behance, Dribbble, LinkedIn, general)...")
+        external_portfolio_task = asyncio.ensure_future(
+            aexternal_portfolio_lookup(query_name, result.get("linkedin_company_url", ""), progress_cb)
+        )
+
     scraped_ok = False
     for url in urls_to_try:
         if progress_cb:
@@ -647,8 +852,58 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
         }
         result["website_suspect"] = False
 
+    if external_portfolio_task is not None:
+        try:
+            external_clients = await external_portfolio_task
+            if external_clients:
+                external_domains = [c["domain"] for c in external_clients]
+                existing = set(result["portfolio_sites"])
+                for d in external_domains:
+                    if d not in existing:
+                        result["portfolio_sites"].append(d)
+                        existing.add(d)
+                result["portfolio_detail"] = external_clients
+                logger.info(f"External portfolio lookup found {len(external_clients)} client domains")
+        except Exception as e:
+            logger.warning(f"External portfolio lookup failed: {e}")
+
     if not scraped_ok and result["website"]:
         result["website"] = ""
+
+    if not result["emails"] and result["website"]:
+        if progress_cb:
+            progress_cb("No emails found — trying /contatti and /contact pages...")
+        contact_paths = [
+            "/contatti", "/contattaci", "/contact", "/contact-us",
+            "/it/contatti", "/chi-siamo/contatti",
+        ]
+        website_base = result["website"].rstrip("/")
+        semaphore = asyncio.Semaphore(3)
+
+        async def _fetch_contact_page(path: str) -> Optional[str]:
+            url = f"{website_base}{path}"
+            try:
+                async with semaphore:
+                    async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+                        resp = await client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.9"})
+                    if resp.status_code == 200 and "text/html" in resp.headers.get("Content-Type", ""):
+                        return resp.text
+            except Exception:
+                pass
+            return None
+
+        contact_tasks = [_fetch_contact_page(p) for p in contact_paths]
+        contact_results = await asyncio.gather(*contact_tasks)
+        for html in contact_results:
+            if not html:
+                continue
+            from .extractor import InformationExtractor
+            temp_extractor = InformationExtractor([{"html": html, "text": "", "url": "", "type": "contact", "external_links": []}])
+            emails = temp_extractor.extract_emails()
+            if emails:
+                result["emails"] = emails
+                logger.info(f"Found {len(emails)} emails from contact page")
+                break
 
     if not result["linkedin_contacts"] and query_name and result["linkedin_company_url"]:
         if progress_cb:
