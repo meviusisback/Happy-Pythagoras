@@ -105,13 +105,22 @@ async def _aretry(
 
 
 def _is_captcha(text: str) -> bool:
+    """Detect captcha/block pages. Uses conservative triggers to avoid false positives."""
+    if len(text) > 20000:
+        return False
     lower = text.lower()
-    triggers = [
-        "captcha", "verify you are human", "verify your identity",
-        "blocked", "access denied", "too many requests",
+    strong_triggers = [
+        "verify you are human", "verify your identity",
+        "access denied", "too many requests",
         "please try again later", "automated queries",
+        "are you a robot", "human verification",
+        "security check", "please complete the security check",
     ]
-    return any(t in lower for t in triggers)
+    if any(t in lower for t in strong_triggers):
+        return True
+    if "captcha" in lower and len(text) < 5000:
+        return True
+    return False
 
 
 def _set_error(msg: str):
