@@ -13,6 +13,7 @@ from agency_finder.ai_config import (
 from agency_finder.ai_schemas import AIEnhancedReport, AIApproach, AIQueryResult, PortfolioHighlight
 from agency_finder.ai_providers import achat, achat_json, alist_models, AIError, clear_model_cache
 from agency_finder.ai_pipeline import aoptimize_search_query, aenhance_report, acommercial_approach, aprocess_full, _best_provider, _best_model
+from agency_finder.core import alookup_agency
 
 
 class TestAiConfig(unittest.TestCase):
@@ -378,6 +379,46 @@ class TestAiSecurity(unittest.TestCase):
         data = {"config": {"providers": [{"name": "openai", "api_key": "secret"}]}}
         redacted = redact_keys(data)
         self.assertEqual(redacted["config"]["providers"][0]["api_key"], "***")
+
+
+class TestAiGuardClauses(unittest.TestCase):
+    """Tests that the AI layer degrades gracefully when pydantic is unavailable."""
+
+    def test_pydantic_available_flag(self):
+        from agency_finder.ai_providers import _PYDANTIC_AVAILABLE
+        self.assertTrue(_PYDANTIC_AVAILABLE)
+
+    def test_schemas_available_flag(self):
+        from agency_finder.ai_pipeline import _SCHEMAS_AVAILABLE
+        self.assertTrue(_SCHEMAS_AVAILABLE)
+
+    @patch("agency_finder.ai_pipeline._SCHEMAS_AVAILABLE", False)
+    def test_pipeline_functions_return_empty_when_missing_pydantic(self):
+        from agency_finder.ai_pipeline import (
+            aoptimize_search_query, aenhance_report,
+            acommercial_approach, aprocess_full,
+        )
+        queries = asyncio.run(aoptimize_search_query("Test"))
+        self.assertEqual(queries, [])
+
+        report = asyncio.run(aenhance_report({"test": True}))
+        self.assertIsNone(report)
+
+        approach = asyncio.run(acommercial_approach({"test": True}))
+        self.assertIsNone(approach)
+
+        result = asyncio.run(aprocess_full({"test": True}))
+        self.assertEqual(result, {"test": True})
+
+    def test_core_lookup_works_with_ai_disabled(self):
+        from agency_finder.ai_config import clear_all_api_keys
+        from agency_finder.config import Config
+        clear_all_api_keys()
+        Config.AI_ENABLED = False
+
+        result = asyncio.run(alookup_agency(name=""))
+        self.assertIn("error", result)
+        self.assertEqual(result["error"], "Provide at least a company name or a VAT number.")
 
 
 if __name__ == "__main__":

@@ -4,9 +4,15 @@ import logging
 from typing import Optional
 
 from .ai_config import configured_providers, provider_info
-from .ai_providers import achat_json
-from .ai_schemas import AIEnhancedReport, AIApproach, AIQueryResult
 from .prompts import QUERY_OPTIMIZER_SYSTEM, REPORT_ENHANCER_SYSTEM, APPROACH_SYSTEM
+
+try:
+    from .ai_schemas import AIEnhancedReport, AIApproach, AIQueryResult
+    from .ai_providers import achat_json, _PYDANTIC_AVAILABLE as _PROVIDERS_OK
+    _SCHEMAS_AVAILABLE = _PROVIDERS_OK
+except ImportError:
+    AIEnhancedReport = AIApproach = AIQueryResult = None
+    _SCHEMAS_AVAILABLE = False
 
 logger = logging.getLogger("agency_finder.ai_pipeline")
 
@@ -25,6 +31,8 @@ async def aoptimize_search_query(name: str, *,
                                  provider: Optional[str] = None,
                                  model: Optional[str] = None,
                                  timeout: int = 30) -> list[str]:
+    if not _SCHEMAS_AVAILABLE:
+        return []
     provider = provider or _best_provider()
     if not provider:
         return []
@@ -49,7 +57,9 @@ async def aoptimize_search_query(name: str, *,
 async def aenhance_report(result: dict, *,
                           provider: Optional[str] = None,
                           model: Optional[str] = None,
-                          timeout: int = 60) -> Optional[AIEnhancedReport]:
+                          timeout: int = 60) -> Optional["AIEnhancedReport"]:
+    if not _SCHEMAS_AVAILABLE or AIEnhancedReport is None:
+        return None
     provider = provider or _best_provider()
     if not provider:
         return None
@@ -77,7 +87,9 @@ async def aenhance_report(result: dict, *,
 async def acommercial_approach(result: dict, *,
                                provider: Optional[str] = None,
                                model: Optional[str] = None,
-                               timeout: int = 60) -> Optional[AIApproach]:
+                               timeout: int = 60) -> Optional["AIApproach"]:
+    if not _SCHEMAS_AVAILABLE or AIApproach is None:
+        return None
     provider = provider or _best_provider()
     if not provider:
         return None
@@ -106,6 +118,8 @@ async def aprocess_full(result: dict, *,
                         provider: Optional[str] = None,
                         model: Optional[str] = None,
                         timeout: int = 60) -> dict:
+    if not _SCHEMAS_AVAILABLE:
+        return result
     provider = provider or _best_provider()
     if not provider:
         return result

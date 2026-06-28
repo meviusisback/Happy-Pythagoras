@@ -11,8 +11,6 @@ from .scraper import WebScraper
 from .extractor import InformationExtractor
 from .utils import make_async_client, USER_AGENT, strip_diacritics
 from .news import aexternal_news_lookup
-from .ai_pipeline import aoptimize_search_query, aprocess_full
-from .ai_config import configured_providers
 from .config import Config
 
 logger = logging.getLogger("agency_finder.core")
@@ -875,12 +873,18 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
 
     if query_name:
         ai_query_task = None
-        if Config.AI_ENABLED and configured_providers():
-            ai_provider = Config.AI_PROVIDER or None
-            ai_model = Config.AI_MODEL or None
-            ai_query_task = asyncio.create_task(
-                aoptimize_search_query(query_name, provider=ai_provider, model=ai_model)
-            )
+        if Config.AI_ENABLED:
+            try:
+                from .ai_config import configured_providers as _cp
+                from .ai_pipeline import aoptimize_search_query as _opt
+                if _cp():
+                    ai_provider = Config.AI_PROVIDER or None
+                    ai_model = Config.AI_MODEL or None
+                    ai_query_task = asyncio.create_task(
+                        _opt(query_name, provider=ai_provider, model=ai_model)
+                    )
+            except ImportError:
+                logger.debug("AI layer not available for query optimization")
 
         if progress_cb:
             progress_cb(f"Searching for official website of '{query_name}'...")
@@ -1232,14 +1236,19 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
                             "source": "fallback",
                         })
 
-    if Config.AI_ENABLED and configured_providers():
-        if progress_cb:
-            progress_cb("Running AI enhancement...")
-        logger.info("Starting AI post-extraction enhancement")
+    if Config.AI_ENABLED:
         try:
-            ai_provider = Config.AI_PROVIDER or None
-            ai_model = Config.AI_MODEL or None
-            result = await aprocess_full(result, provider=ai_provider, model=ai_model, timeout=45)
+            from .ai_config import configured_providers as _cp
+            from .ai_pipeline import aprocess_full as _full
+            if _cp():
+                if progress_cb:
+                    progress_cb("Running AI enhancement...")
+                logger.info("Starting AI post-extraction enhancement")
+                ai_provider = Config.AI_PROVIDER or None
+                ai_model = Config.AI_MODEL or None
+                result = await _full(result, provider=ai_provider, model=ai_model, timeout=45)
+        except ImportError:
+            logger.debug("AI layer not available for post-extraction enhancement")
         except Exception as e:
             logger.warning(f"AI enhancement failed: {e}")
 

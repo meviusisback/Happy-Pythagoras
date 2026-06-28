@@ -7,22 +7,38 @@ import asyncio
 from agency_finder.core import lookup_agency, alookup_agency
 from agency_finder.config import Config
 from agency_finder.search import last_search_error as _last_search_error
-from agency_finder.ai_config import (
-    get_registered_providers, provider_info, is_configured,
-    set_api_key, clear_all_api_keys, redact_keys,
-)
-from agency_finder.ai_providers import alist_models
+from agency_finder.ai_config import redact_keys
+
+
+def _get_ai_modules():
+    """Lazy-load AI modules. Returns None if pydantic isn't installed."""
+    try:
+        from agency_finder.ai_config import (
+            get_registered_providers, provider_info, is_configured,
+            set_api_key, clear_all_api_keys,
+        )
+        from agency_finder.ai_providers import alist_models, _PYDANTIC_AVAILABLE
+        if not _PYDANTIC_AVAILABLE:
+            return None
+        return (get_registered_providers, provider_info, is_configured,
+                set_api_key, clear_all_api_keys, alist_models)
+    except ImportError:
+        return None
 
 
 @st.cache_data(ttl=300)
 def _cached_models(provider: str) -> list[str]:
     """Fetch available models for a provider, cached for 5 minutes."""
-    if is_configured(provider):
+    mods = _get_ai_modules()
+    if mods is None:
+        return []
+    _, provider_info_fn, is_configured_fn, _, _, _, alist_models_fn = mods
+    if is_configured_fn(provider):
         try:
-            return asyncio.run(alist_models(provider))
+            return asyncio.run(alist_models_fn(provider))
         except Exception:
             pass
-    return provider_info(provider).get("fallback_models", [])
+    return provider_info_fn(provider).get("fallback_models", [])
 
 
 # Configure Page
@@ -154,48 +170,61 @@ Config.TIMEOUT = st.sidebar.slider("Request Timeout (s)", min_value=5, max_value
 # -----------------
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 AI Layer")
-ai_enabled = st.sidebar.checkbox("Enable AI enhancement", value=Config.AI_ENABLED, key="ai_enabled_checkbox")
+ai_modules = _get_ai_modules()
 
-if ai_enabled:
-    providers = get_registered_providers()
-    default_idx = providers.index(Config.AI_PROVIDER) if Config.AI_PROVIDER in providers else 0
-    sel_provider = st.sidebar.selectbox(
-        "Provider", options=providers, index=default_idx,
-        format_func=lambda p: provider_info(p)["label"],
-        key="ai_provider_sel",
+if ai_modules is None:
+    st.sidebar.warning(
+        "Optional AI layer unavailable. "
+        "Install: `pip install pydantic openai anthropic google-genai`"
     )
-    Config.AI_PROVIDER = sel_provider
-
-    models = _cached_models(sel_provider)
-    default_model_idx = models.index(Config.AI_MODEL) if Config.AI_MODEL in models else 0
-    sel_model = st.sidebar.selectbox("Model", options=models, index=default_model_idx, key="ai_model_sel")
-    Config.AI_MODEL = sel_model
-
-    with st.sidebar.expander("🔑 Manage API Keys"):
-        for p in providers:
-            info = provider_info(p)
-            key_val = st.text_input(
-                f"{info['label']} Key",
-                type="password",
-                value="",
-                placeholder="••••••••" if is_configured(p) else "Enter key...",
-                key=f"ai_key_{p}",
-            )
-            if key_val:
-                set_api_key(p, key_val)
-                _cached_models.clear()
-        if st.button("🗑️ Clear all keys", key="ai_clear_keys"):
-            clear_all_api_keys()
-            _cached_models.clear()
-            st.rerun()
-
-    status_parts = []
-    for p in providers:
-        lab = provider_info(p)["label"]
-        status_parts.append(f"{'✓' if is_configured(p) else '✗'} {lab}")
-    st.sidebar.caption(" | ".join(status_parts))
-else:
     Config.AI_ENABLED = False
+else:
+    (get_registered_providers, provider_info, is_configured,
+     set_api_key, clear_all_api_keys, alist_models) = ai_modules
+
+    ai_enabled = st.sidebar.checkbox("Enable AI enhancement", value=Config.AI_ENABLED, key="ai_enabled_checkbox")
+
+    if ai_enabled:
+        providers = get_registered_providers()
+        default_idx = providers.index(Config.AI_PROVIDER) if Config.AI_PROVIDER in providers else 0
+        sel_provider = st.sidebar.selectbox(
+            "Provider", options=providers, index=default_idx,
+            format_func=lambda p: provider_info(p)["label"],
+            key="ai_provider_sel",
+        )
+        Config.AI_PROVIDER = sel_provider
+
+        models = _cached_models(sel_provider)
+        default_model_idx = models.index(Config.AI_MODEL) if Config.AI_MODEL in models else 0
+        sel_model = st.sidebar.selectbox("Model", options=models, index=default_model_idx, key="ai_model_sel")
+        Config.AI_MODEL = sel_model
+
+        with st.sidebar.expander("🔑 Manage API Keys"):
+            for p in providers:
+                info = provider_info(p)
+                key_val = st.text_input(
+                    f"{info['label']} Key",
+                    type="password",
+                    value="",
+                    placeholder="••••••••" if is_configured(p) else "Enter key...",
+                    key=f"ai_key_{p}",
+                )
+                if key_val:
+                    set_api_key(p, key_val)
+                    _cached_models.clear()
+            if st.button("🗑️ Clear all keys", key="ai_clear_keys"):
+                clear_all_api_keys()
+                _cached_models.clear()
+                st.rerun()
+
+        status_parts = []
+        for p in providers:
+            lab = provider_info(p)["label"]
+            status_parts.append(f"{'✓' if is_configured(p) else '✗'} {lab}")
+        st.sidebar.caption(" | ".join(status_parts))
+        Config.AI_ENABLED = True
+    else:
+        Config.AI_ENABLED = False
 
 # Tabs
 tab_single, tab_bulk = st.tabs(["🔍 Single Lookup", "📁 Bulk Import (CSV)"])

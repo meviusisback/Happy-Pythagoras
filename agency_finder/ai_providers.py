@@ -3,7 +3,13 @@ import time
 import logging
 from typing import Optional, List, Type
 
-from pydantic import BaseModel
+try:
+    from pydantic import BaseModel
+    _PYDANTIC_AVAILABLE = True
+except ImportError:
+    class BaseModel:
+        pass
+    _PYDANTIC_AVAILABLE = False
 
 from .ai_config import get_api_key, provider_info
 
