@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import logging
 from typing import Optional, List, Type
@@ -83,6 +84,19 @@ async def _achat_single(provider: str, model: str, messages: list, *,
         raise AIError(provider, f"Unknown SDK family: {family}")
 
 
+def _extract_from_chat_wrapper(response_text: str) -> str:
+    """If the raw string is a ChatCompletion wrapper, extract choices[0].message.content."""
+    try:
+        parsed = json.loads(response_text)
+        if isinstance(parsed, dict) and "choices" in parsed and parsed["choices"]:
+            content = parsed["choices"][0].get("message", {}).get("content", "")
+            if content:
+                return content
+    except (json.JSONDecodeError, KeyError, IndexError):
+        pass
+    return response_text
+
+
 async def _achat_openai(provider: str, model: str, messages: list, *,
                         system: Optional[str], json_mode: bool, timeout: int) -> str:
     client = _get_openai_client(provider, timeout)
@@ -98,10 +112,12 @@ async def _achat_openai(provider: str, model: str, messages: list, *,
     try:
         response = await client.chat.completions.create(**kwargs)
         if isinstance(response, str):
-            if not response.lstrip().startswith(("{", "[")):
-                raise AIError(provider, f"Provider returned non-chat response: {response[:100]!r}")
-            logger.debug(f"{provider} returned a raw string response")
-            return response
+            extracted = _extract_from_chat_wrapper(response)
+            if extracted != response:
+                logger.debug(f"{provider}: extracted inner content from ChatCompletion wrapper")
+            if not extracted.lstrip().startswith(("{", "[")):
+                raise AIError(provider, f"Provider returned non-chat response: {extracted[:100]!r}")
+            return extracted
         return response.choices[0].message.content or ""
     except AIError:
         raise
@@ -214,7 +230,10 @@ async def _achat_json_openai(provider: str, model: str, messages: list, *,
             },
         )
         if isinstance(response, str):
-            raw = response
+            extracted = _extract_from_chat_wrapper(response)
+            if extracted != response:
+                logger.debug(f"{provider}: extracted inner content from ChatCompletion wrapper")
+            raw = extracted
         else:
             raw = response.choices[0].message.content or ""
 
