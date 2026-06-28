@@ -214,6 +214,7 @@ class InformationExtractor:
         ignore_patterns = {"sentry.io", "w3.org", "example.com", "yourdomain.com",
                            "domain.com", "bootstrap.com", "schema.org"}
         role_prefixes = ("noreply@", "no-reply@", "postmaster@", "root@", "abuse@", "webmaster@")
+        _IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tiff", "avif"}
 
         valid = set()
         for email in found:
@@ -221,6 +222,9 @@ class InformationExtractor:
             if domain in ignore_patterns:
                 continue
             if any(email.startswith(p) for p in role_prefixes):
+                continue
+            tld = domain.rsplit(".", 1)[-1] if "." in domain else ""
+            if tld in _IMAGE_EXTS:
                 continue
             valid.add(email)
 

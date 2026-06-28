@@ -397,11 +397,11 @@ def _name_appears_in_page(name_lower: str, name_words: List[str], html: str) -> 
 
 
 async def _aguess_direct_domains(query: str, max_results: int = 10) -> List[Dict[str, str]]:
-    name_lower = query.lower().strip()
-    name_words = [w for w in name_lower.split() if len(w) > 2]
     variants = _generate_name_variants(query)
     if not variants:
         return []
+    primary_name = variants[0].lower().strip()
+    primary_words = [w for w in primary_name.split() if len(w) > 2]
 
     tlds = ["it", "com", "eu", "net", "org", "io"]
     candidates = []
@@ -425,7 +425,7 @@ async def _aguess_direct_domains(query: str, max_results: int = 10) -> List[Dict
         try:
             resp = await _aretry(url, method="GET", timeout=5, max_retries=0)
             if resp and resp.status_code == 200 and not _is_captcha(resp.text):
-                if _name_appears_in_page(name_lower, name_words, resp.text):
+                if _name_appears_in_page(primary_name, primary_words, resp.text):
                     title = _extract_title(resp.text) or url
                     results.append({"title": title, "link": url, "snippet": "Direct domain guess"})
                     if len(results) >= 3:
@@ -639,7 +639,7 @@ async def asearch_query(query: str, max_results: int = 10) -> List[Dict[str, str
     try:
         results = await asyncio.wait_for(
             asyncio.gather(*tasks, return_exceptions=True),
-            timeout=15,
+            timeout=30,
         )
     except (asyncio.TimeoutError, TimeoutError):
         for t in tasks:

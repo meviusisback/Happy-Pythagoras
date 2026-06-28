@@ -970,10 +970,10 @@ class TestSearchOuterTimeout(unittest.TestCase):
         from agency_finder.search import asearch_query
         import time
         t0 = time.time()
-        result = asyncio.run(asyncio.wait_for(asearch_query("test", 3), timeout=20))
+        result = asyncio.run(asyncio.wait_for(asearch_query("test", 3), timeout=40))
         elapsed = time.time() - t0
         self.assertIsInstance(result, list)
-        self.assertLess(elapsed, 20)
+        self.assertLess(elapsed, 40)
 
     @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
     @patch("agency_finder.search._asearch_wikipedia", new_callable=AsyncMock)
