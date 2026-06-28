@@ -821,7 +821,7 @@ async def aexternal_portfolio_lookup(
         "linkedin.com": 3, "generic_search": 1,
     }
     verified.sort(key=lambda c: (SOURCE_PRIORITY.get(c.get("source"), 0), c.get("domain", "")), reverse=True)
-    return verified[:30]
+    return verified
 
 
 async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progress_cb=None) -> Dict[str, Any]:

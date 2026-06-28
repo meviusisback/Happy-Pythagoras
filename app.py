@@ -301,12 +301,15 @@ with tab_single:
                     with st.container():
                         st.subheader("📂 Websites Created / Worked With")
                         if results['portfolio_sites']:
-                            # Put domains in a multi-column grid
+                            # Top 20 in visual 4-column grid
                             cols = st.columns(4)
                             for i, d in enumerate(results['portfolio_sites'][:20]):
                                 cols[i % 4].markdown(f"🔗 [{d}](http://{d})")
+                            # Remaining as compact list
                             if len(results['portfolio_sites']) > 20:
-                                st.info(f"and {len(results['portfolio_sites']) - 20} more domains extracted.")
+                                st.markdown("**More domains:**")
+                                for d in results['portfolio_sites'][20:]:
+                                    st.markdown(f"- [{d}](http://{d})")
                         else:
                             st.markdown("*No client portfolio websites extracted*")
 
