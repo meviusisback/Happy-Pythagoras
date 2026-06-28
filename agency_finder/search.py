@@ -138,6 +138,9 @@ async def _asearch_ddg_lite(query: str, max_results: int = 10) -> List[Dict[str,
                 _set_error("DuckDuckGo Lite search failed after retries (network error).")
                 return []
             if response.status_code != 200:
+                if response.status_code == 202:
+                    logger.warning("DuckDuckGo Lite returned HTTP 202 (challenge page) — not retrying")
+                    return []
                 if attempt == 0:
                     logger.warning(f"DuckDuckGo Lite HTTP {response.status_code}, retrying")
                     await asyncio.sleep(0.5)
@@ -232,6 +235,9 @@ async def _asearch_ddg_html(query: str, max_results: int = 10) -> List[Dict[str,
                 _set_error("DuckDuckGo HTML search failed after retries (network error).")
                 return []
             if response.status_code != 200:
+                if response.status_code == 202:
+                    logger.warning("DuckDuckGo HTML returned HTTP 202 (challenge page) — not retrying")
+                    return []
                 if attempt == 0:
                     logger.warning(f"DuckDuckGo HTML HTTP {response.status_code}, retrying")
                     await asyncio.sleep(0.5)

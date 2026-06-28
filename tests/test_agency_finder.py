@@ -1238,6 +1238,24 @@ class TestSearchRobustness(unittest.TestCase):
         self.assertEqual(mock_aretry.call_count, 2)
 
     @patch("agency_finder.search._aretry")
+    def test_ddg_lite_does_not_retry_on_202(self, mock_aretry):
+        from agency_finder.search import _asearch_ddg_lite
+        challenge_resp = MagicMock(status_code=202, text="<html>challenge</html>")
+        mock_aretry.return_value = challenge_resp
+        result = asyncio.run(_asearch_ddg_lite("test", 5))
+        self.assertEqual(result, [])
+        self.assertEqual(mock_aretry.call_count, 1)
+
+    @patch("agency_finder.search._aretry")
+    def test_ddg_html_does_not_retry_on_202(self, mock_aretry):
+        from agency_finder.search import _asearch_ddg_html
+        challenge_resp = MagicMock(status_code=202, text="<html>challenge</html>")
+        mock_aretry.return_value = challenge_resp
+        result = asyncio.run(_asearch_ddg_html("test", 5))
+        self.assertEqual(result, [])
+        self.assertEqual(mock_aretry.call_count, 1)
+
+    @patch("agency_finder.search._aretry")
     def test_direct_domain_guess_finds_website(self, mock_aretry):
         from agency_finder.search import _aguess_direct_domains
         mock_aretry.return_value = MagicMock(status_code=200, text="<html><title>Acme</title></html>")
