@@ -4,7 +4,13 @@ import xml.etree.ElementTree as ET
 from agency_finder.vies import check_vat, acheck_vat
 from agency_finder.scraper import WebScraper
 from agency_finder.extractor import InformationExtractor, _decode_cfemail, _deobfuscate_email
-from agency_finder.core import find_linkedin_employees, scrape_linkedin_company_page
+from agency_finder.core import (
+    find_linkedin_employees, scrape_linkedin_company_page,
+    _role_tier, ROLE_CLAUSE, IGNORE_DOMAINS,
+    _afetch_awwwards_portfolio, _afetch_designrush_profile,
+    _afetch_themanifest_profile,
+)
+from agency_finder.utils import strip_diacritics
 
 
 class TestViesClient(unittest.TestCase):
@@ -493,9 +499,10 @@ class TestScraperPortfolioKeywords(unittest.TestCase):
 
 class TestExternalPortfolioLookup(unittest.TestCase):
 
+    @patch("agency_finder.core._averify_client_link", new_callable=AsyncMock)
     @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
     @patch("agency_finder.core.httpx.AsyncClient")
-    def test_clutch_profile_extracts_client_links(self, MockClient, mock_search):
+    def test_clutch_profile_extracts_client_links(self, MockClient, mock_search, mock_verify):
         # Mock DDG search returning a Clutch profile
         mock_search.return_value = [
             {"title": "Cantiere Creativo su Clutch", "link": "https://clutch.co/profile/cantiere-creativo", "snippet": "..."}
@@ -509,6 +516,8 @@ class TestExternalPortfolioLookup(unittest.TestCase):
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
         MockClient.return_value = mock_client
+        # Mock verification to always pass
+        mock_verify.return_value = True
 
         from agency_finder.core import aexternal_portfolio_lookup
         import asyncio
@@ -631,9 +640,307 @@ class TestNewsModule(unittest.TestCase):
         import time
         cache_k = "test_cache_key"
         NEWS_CACHE[cache_k] = (time.time(), [{"title": "cached"}])
-        # Should return cached data without calling any fetchers
         self.assertIn(cache_k, NEWS_CACHE)
         del NEWS_CACHE[cache_k]
+
+
+class TestStripDiacritics(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(strip_diacritics("Cantiere Creativo"), "Cantiere Creativo")
+
+    def test_accented(self):
+        self.assertEqual(strip_diacritics("Milano"), "Milano")
+
+    def test_italian_accents(self):
+        self.assertEqual(strip_diacritics("Ragú"), "Ragu")
+        self.assertEqual(strip_diacritics("café"), "cafe")
+        self.assertEqual(strip_diacritics("foco"), "foco")
+
+
+class TestRoleTier(unittest.TestCase):
+
+    def test_ceo_is_tier1(self):
+        self.assertEqual(_role_tier("CEO"), 1)
+
+    def test_founder_is_tier1(self):
+        self.assertEqual(_role_tier("Founder"), 1)
+
+    def test_sales_director_is_tier1(self):
+        self.assertEqual(_role_tier("Sales Director"), 1)
+
+    def test_marketing_manager_is_tier1(self):
+        self.assertEqual(_role_tier("Marketing Manager"), 1)
+
+    def test_account_manager_is_tier1(self):
+        self.assertEqual(_role_tier("Account Manager"), 1)
+
+    def test_partnerships_is_tier1(self):
+        self.assertEqual(_role_tier("Head of Partnerships"), 1)
+
+    def test_business_development_is_tier1(self):
+        self.assertEqual(_role_tier("Business Development Manager"), 1)
+
+    def test_responsabile_is_tier1(self):
+        self.assertEqual(_role_tier("Responsabile Commerciale"), 1)
+
+    def test_developer_is_tier3(self):
+        self.assertEqual(_role_tier("Developer"), 3)
+
+    def test_designer_is_tier3(self):
+        self.assertEqual(_role_tier("Graphic Designer"), 3)
+
+    def test_engineer_is_tier3(self):
+        self.assertEqual(_role_tier("Software Engineer"), 3)
+
+    def test_intern_is_tier3(self):
+        self.assertEqual(_role_tier("Intern"), 3)
+
+    def test_project_manager_is_tier2(self):
+        self.assertEqual(_role_tier("Project Manager"), 2)
+
+    def test_empty_is_tier2(self):
+        self.assertEqual(_role_tier(""), 2)
+
+    def test_unknown_role_is_tier2(self):
+        self.assertEqual(_role_tier("Coordinator"), 2)
+
+
+class TestLinkedInNoDrop(unittest.TestCase):
+
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
+    def test_no_contacts_dropped_based_on_role(self, mock_search):
+        contacts = [
+            {"name": "Mario Rossi", "role": "CEO", "url": "https://linkedin.com/in/mario-rossi", "snippet": "CEO at Cantiere Creativo"},
+            {"name": "Giulia Bianchi", "role": "Junior Intern", "url": "https://linkedin.com/in/giulia-bianchi", "snippet": "Intern at Cantiere Creativo"},
+            {"name": "Luca Verdi", "role": "Sales Director", "url": "https://linkedin.com/in/luca-verdi", "snippet": "Sales Director at Cantiere Creativo"},
+        ]
+        mock_search.return_value = [
+            {"title": c["name"] + " - " + c["role"] + " | LinkedIn", "link": c["url"], "snippet": c["snippet"]}
+            for c in contacts
+        ]
+        from agency_finder.core import afind_linkedin_employees
+        import asyncio
+        results = asyncio.run(afind_linkedin_employees(
+            "Cantiere Creativo",
+            "https://linkedin.com/company/cantiere-creativo",
+        ))
+        self.assertEqual(len(results), 3)
+        roles = [c["role"] for c in results]
+        self.assertIn("CEO", roles)
+        self.assertIn("Junior Intern", roles)
+        self.assertIn("Sales Director", roles)
+
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
+    def test_tier1_before_tier3(self, mock_search):
+        contacts = [
+            {"name": "Giulia Bianchi", "role": "Designer", "url": "https://linkedin.com/in/giulia-bianchi", "snippet": "Designer at Cantiere Creativo"},
+            {"name": "Mario Rossi", "role": "CEO", "url": "https://linkedin.com/in/mario-rossi", "snippet": "CEO at Cantiere Creativo"},
+            {"name": "Luca Verdi", "role": "Developer", "url": "https://linkedin.com/in/luca-verdi", "snippet": "Developer at Cantiere Creativo"},
+        ]
+        mock_search.return_value = [
+            {"title": c["name"] + " - " + c["role"] + " | LinkedIn", "link": c["url"], "snippet": c["snippet"]}
+            for c in contacts
+        ]
+        from agency_finder.core import afind_linkedin_employees
+        import asyncio
+        results = asyncio.run(afind_linkedin_employees(
+            "Cantiere Creativo",
+            "https://linkedin.com/company/cantiere-creativo",
+        ))
+        roles_by_tier = {}
+        for c in results:
+            tier = _role_tier(c["role"])
+            roles_by_tier.setdefault(tier, []).append(c["role"])
+        self.assertIn(1, roles_by_tier, "Should have a tier-1 (commercial) contact")
+        self.assertIn(3, roles_by_tier, "Should have a tier-3 (IC) contact")
+        self.assertEqual(_role_tier("CEO"), 1)
+        self.assertEqual(_role_tier("Designer"), 3)
+
+
+class TestWebsiteDetection(unittest.TestCase):
+
+    def test_bing_in_ignore_domains(self):
+        self.assertIn("bing.com", IGNORE_DOMAINS)
+
+    def test_duckduckgo_in_ignore_domains(self):
+        self.assertIn("duckduckgo.com", IGNORE_DOMAINS)
+
+    def test_brave_in_ignore_domains(self):
+        self.assertIn("search.brave.com", IGNORE_DOMAINS)
+
+    def test_yahoo_in_ignore_domains(self):
+        self.assertIn("yahoo.com", IGNORE_DOMAINS)
+
+    def test_qwant_in_ignore_domains(self):
+        self.assertIn("qwant.com", IGNORE_DOMAINS)
+
+
+class TestPortfolioVerification(unittest.TestCase):
+
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_verify_client_link_positive(self, MockClient):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = '<html><body>We worked with Cantiere Creativo on this project.</body></html>'
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
+
+        from agency_finder.core import _averify_client_link
+        import asyncio
+        result = asyncio.run(_averify_client_link(
+            {"domain": "example.com", "url": "https://example.com", "source": "clutch.co"},
+            "Cantiere Creativo",
+        ))
+        self.assertTrue(result)
+
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_verify_client_link_negative(self, MockClient):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = '<html><body>This is a completely unrelated page about cooking.</body></html>'
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
+
+        from agency_finder.core import _averify_client_link, _verified_cache
+        _verified_cache.clear()
+        import asyncio
+        result = asyncio.run(_averify_client_link(
+            {"domain": "example.com", "url": "https://example.com", "source": "clutch.co"},
+            "Cantiere Creativo",
+        ))
+        self.assertFalse(result)
+        _verified_cache.clear()
+
+    @patch("agency_finder.core.httpx.AsyncClient")
+    def test_verify_client_link_handles_diacritics(self, MockClient):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = '<html><body>Progetto realizzato per Cantiere Creativo S.r.l.</body></html>'
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_client
+
+        from agency_finder.core import _averify_client_link, _verified_cache
+        _verified_cache.clear()
+        import asyncio
+        result = asyncio.run(_averify_client_link(
+            {"domain": "example.com", "url": "https://example.com", "source": "clutch.co"},
+            "Cantiere Creativo",
+        ))
+        self.assertTrue(result)
+        _verified_cache.clear()
+
+
+class TestClientLogoDetection(unittest.TestCase):
+
+    def test_extract_client_logos_finds_trusted_by_brands(self):
+        pages = [{
+            "url": "https://agency.it/clients",
+            "type": "portfolio",
+            "text": "Our trusted partners and clients",
+            "html": """
+            <section>
+                <h2>Trusted by</h2>
+                <div>
+                    <img src="https://cdn.clienta.com/logo.png" alt="ClientA">
+                    <img src="https://cdn.clientb.com/assets/logo.svg" alt="ClientB">
+                </div>
+            </section>
+            """,
+            "external_links": [],
+        }]
+        ext = InformationExtractor(pages)
+        logos = ext.extract_client_logos()
+        self.assertTrue(len(logos) > 0)
+        has_clienta = any("clienta" in d for d in logos)
+        has_clientb = any("clientb" in d for d in logos)
+        self.assertTrue(has_clienta or has_clientb)
+
+    def test_extract_client_websites_v2_includes_logos(self):
+        pages = [{
+            "url": "https://agency.it",
+            "type": "portfolio",
+            "text": "Our clients",
+            "html": """
+            <div>
+                <h2>Trusted by</h2>
+                <a href="https://client-x.com">Client X</a>
+                <img src="https://cdn.clienty.com/logo.png" alt="ClientY">
+            </div>
+            """,
+            "external_links": ["https://client-x.com"],
+        }]
+        ext = InformationExtractor(pages)
+        v2 = ext.extract_client_websites_v2()
+        self.assertTrue(any("client-x" in d for d in v2))
+        self.assertTrue(any("clienty" in d for d in v2))
+
+
+class TestNewOffsiteSources(unittest.TestCase):
+
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
+    def test_awwwards_source(self, mock_search):
+        mock_search.return_value = [
+            {"title": "Agency on Awwwards", "link": "https://awwwards.com/sites/agency-portfolio", "snippet": "https://client.com project"}
+        ]
+        import asyncio
+        results = asyncio.run(_afetch_awwwards_portfolio("Cantiere Creativo"))
+        sources = [c["source"] for c in results]
+        self.assertIn("awwwards.com", sources)
+
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
+    def test_designrush_source(self, mock_search):
+        mock_search.return_value = [
+            {"title": "Agency on DesignRush", "link": "https://designrush.com/agency/profile/agency", "snippet": "..."}
+        ]
+        from agency_finder.core import _afetch_designrush_profile
+        import asyncio
+        results = asyncio.run(_afetch_designrush_profile("Cantiere Creativo"))
+        self.assertIsInstance(results, list)
+
+    @patch("agency_finder.core.asearch_query", new_callable=AsyncMock)
+    def test_themanifest_source(self, mock_search):
+        mock_search.return_value = [
+            {"title": "Agency on The Manifest", "link": "https://themanifest.com/it/company/agency", "snippet": "..."}
+        ]
+        import asyncio
+        results = asyncio.run(_afetch_themanifest_profile("Cantiere Creativo"))
+        self.assertIsInstance(results, list)
+
+
+class TestRoleClauseCommercial(unittest.TestCase):
+
+    def test_contains_business_development(self):
+        self.assertIn("business development", ROLE_CLAUSE.lower())
+
+    def test_contains_account_manager(self):
+        self.assertIn("account manager", ROLE_CLAUSE.lower())
+
+    def test_contains_partnerships(self):
+        self.assertIn("partnerships", ROLE_CLAUSE.lower())
+
+    def test_contains_sales_director(self):
+        self.assertIn("sales director", ROLE_CLAUSE.lower())
+
+    def test_contains_marketing_director(self):
+        self.assertIn("marketing director", ROLE_CLAUSE.lower())
+
+    def test_contains_growth_manager(self):
+        self.assertIn("growth manager", ROLE_CLAUSE.lower())
+
+    def test_contains_responsabile_commerciale(self):
+        self.assertIn("responsabile commerciale", ROLE_CLAUSE.lower())
+
+    def test_contains_country_manager(self):
+        self.assertIn("country manager", ROLE_CLAUSE.lower())
 
 
 if __name__ == "__main__":

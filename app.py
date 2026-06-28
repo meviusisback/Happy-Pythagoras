@@ -228,7 +228,7 @@ with tab_single:
                                 st.markdown(f"**LinkedIn Page:** [{li_name}]({li_url})")
                             st.markdown("**Key LinkedIn Contacts:**")
                             if results['linkedin_contacts']:
-                                for c in results['linkedin_contacts'][:8]:
+                                for c in results['linkedin_contacts'][:20]:
                                     src = c.get('source', '')
                                     src_label = ' [anchored]' if src == 'company_page' else f' [{src}]' if src else ''
                                     st.markdown(f"- [{c['name']}]({c['url']}) - *{c['role']}*{src_label}")

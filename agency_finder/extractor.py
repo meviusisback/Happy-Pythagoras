@@ -386,6 +386,82 @@ class InformationExtractor:
                 
         return sorted(list(set(cleaned_services)))
 
+    _TRUSTED_BY_PATTERNS = re.compile(
+        r'(trusted\s+by|our\s+clients|works?\s+with|collaborated\s+with|'
+        r'i\s+nostri\s+clienti|realizzato\s+per|aziende\s+che\s+ci\s+scelgono|'
+        r'chi\s+ha\s+scelto|i\s+brand\s+che|clienti|progetti\s+realizzati)',
+        re.IGNORECASE,
+    )
+    _BRAND_IGNORE = {
+        "logo", "icon", "image", "banner", "img", "photo", "thumb", "avatar",
+        "background", "bg", "hero", "cover", "brand", "about", "contact",
+        "cookie", "privacy", "menu", "nav", "footer", "home", "search",
+        "close", "arrow", "button", "social", "share", "print",
+    }
+
+    def extract_client_logos(self) -> List[str]:
+        """Extract brand-like domains from img alt/src near 'trusted by' text, and nearby text patterns."""
+        domains: List[str] = []
+
+        for page in self.pages:
+            html = page.get("html", "")
+            if not html:
+                continue
+
+            soup = BeautifulSoup(html, "html.parser")
+            base_url = page.get("url", "")
+
+            # 1. Find text nodes matching trusted-by patterns
+            for node in soup.find_all(string=self._TRUSTED_BY_PATTERNS):
+                parent = node.parent
+                if parent is None:
+                    continue
+                # Search in the parent element and siblings for img tags and domain-like strings
+                container = parent
+                for _ in range(3):
+                    if container.parent:
+                        container = container.parent
+                # Look for img alt text
+                for img in container.find_all("img", alt=True):
+                    alt = img["alt"].strip()
+                    if not alt or len(alt) > 50 or len(alt) < 2:
+                        continue
+                    alt_lower = alt.lower()
+                    if any(skip in alt_lower for skip in self._BRAND_IGNORE):
+                        continue
+                    # If alt looks like a brand name (capitalized, short), use the src domain
+                    src = img.get("src", "")
+                    if src:
+                        parsed = urlparse(src)
+                        if parsed.netloc:
+                            domain = parsed.netloc.lower()
+                            domain = domain[4:] if domain.startswith("www.") else domain
+                            if "." in domain and domain not in self._BRAND_IGNORE:
+                                domains.append(domain)
+                # Also scan for domain-like strings in nearby text
+                text = container.get_text(" ", strip=True)[:2000]
+                for m in re.finditer(r'\b([a-z0-9][a-z0-9.-]*\.(?:it|com|io|net|org|co|me))\b', text):
+                    d = m.group(1).lower()
+                    d = d[4:] if d.startswith("www.") else d
+                    if "." in d and d.split(".")[0] not in self._BRAND_IGNORE:
+                        domains.append(d)
+
+        # Deduplicate preserving order
+        seen = set()
+        unique: List[str] = []
+        for d in domains:
+            if d not in seen:
+                seen.add(d)
+                unique.append(d)
+        return unique
+
+    def extract_client_websites_v2(self) -> List[str]:
+        """Combines external link extraction with logo/trusted-by detection."""
+        from_links = set(self.extract_client_websites())
+        from_logos = set(self.extract_client_logos())
+        combined = list(from_links | from_logos)
+        return sorted(combined)
+
     def extract_payment_integrations(self) -> Dict[str, Any]:
         """
         Confirms if the agency offers payment provider integrations,

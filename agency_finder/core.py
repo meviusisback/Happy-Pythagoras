@@ -9,7 +9,7 @@ from .search import asearch_query
 from .vies import acheck_vat
 from .scraper import WebScraper
 from .extractor import InformationExtractor
-from .utils import make_async_client, USER_AGENT
+from .utils import make_async_client, USER_AGENT, strip_diacritics
 from .news import aexternal_news_lookup
 
 logger = logging.getLogger("agency_finder.core")
@@ -35,6 +35,10 @@ IGNORE_DOMAINS = {
     "klerk.ru", "tumgik.com",
     "belka.ai",
     "belkasoft.com",
+    "bing.com", "duckduckgo.com", "qwant.com", "startpage.com",
+    "ecosia.org", "search.brave.com", "brave.com",
+    "yahoo.com", "yahoo.it", "search.yahoo.com",
+    "aol.com", "ask.com", "baidu.com",
 }
 
 PARKING_SIGNALS = [
@@ -190,7 +194,7 @@ async def _aextract(website: str, query_name: str, result: Dict[str, Any], progr
         result["telephones"] = extractor.extract_telephones()
         result["extracted_address"] = extractor.extract_address()
         result["services"] = extractor.extract_services()
-        result["portfolio_sites"] = extractor.extract_client_websites()
+        result["portfolio_sites"] = extractor.extract_client_websites_v2()
         result["payment_integration"] = extractor.extract_payment_integrations()
 
         if query_name:
@@ -321,10 +325,44 @@ def scrape_linkedin_company_page(
     return asyncio.run(ascrape_linkedin_company_page(linkedin_company_url, max_results))
 
 
+def _role_tier(role_text: str) -> int:
+    """Rank a contact's role for display ordering (1=commercial-facing, 2=other manager, 3=IC).
+    Never rejects — every contact gets a tier, just affects sort order."""
+    r = role_text.lower().strip()
+    if not r or r == "professional":
+        return 2
+
+    tier1_kw = (
+        "director", "head of", "responsabile", "country manager",
+        "managing director", "ceo", "founder", "co-founder", "owner",
+        "amministratore", "direttore", "president", "vp",
+        "sales", "business development", "marketing", "partnerships",
+        "account manager", "account executive", "growth",
+        "commercial", "chief revenue officer", "cro",
+    )
+    tier3_kw = (
+        "developer", "engineer", "designer", "analyst", "consultant",
+        "specialist", "intern", "stage", "tirocinante", "junior",
+        "senior developer", "senior engineer", "devops",
+        "architect", "qa", "tester", "technical",
+    )
+
+    if any(kw in r for kw in tier1_kw):
+        return 1
+    if any(kw in r for kw in tier3_kw):
+        return 3
+    return 2
+
+
 ROLE_CLAUSE = (
-    'CEO OR founder OR CTO OR direttore OR owner OR '
-    '"marketing manager" OR "sales manager" OR "IT manager" OR '
-    'amministratore OR responsabile'
+    'CEO OR founder OR co-founder OR owner OR direttore OR amministratore OR '
+    '"managing director" OR "commercial director" OR "sales director" OR '
+    '"marketing director" OR "business development" OR "partnerships" OR '
+    '"country manager" OR "client director" OR "head of sales" OR '
+    '"head of marketing" OR "head of business development" OR '
+    '"sales manager" OR "marketing manager" OR "account manager" OR '
+    '"growth manager" OR "responsabile commerciale" OR "responsabile vendite" OR '
+    '"responsabile marketing" OR "responsabile sviluppo"'
 )
 
 
@@ -557,6 +595,162 @@ async def _afetch_generic_portfolio(agency_name: str, progress_cb=None) -> List[
     return clients
 
 
+_verified_cache: Dict[str, bool] = {}
+
+
+async def _averify_client_link(candidate: Dict[str, str], agency_name: str) -> bool:
+    """Fetch the source page and check that the agency name actually appears on it."""
+    url = candidate.get("url", "")
+    if not url:
+        return False
+    cache_key = url.rstrip("/")
+    if cache_key in _verified_cache:
+        return _verified_cache[cache_key]
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": USER_AGENT})
+        if resp.status_code != 200:
+            _verified_cache[cache_key] = False
+            return False
+        html_text = resp.text
+        name_lower = agency_name.lower()
+        name_plain = strip_diacritics(name_lower)
+        text_lower = html_text.lower()
+        text_plain = strip_diacritics(text_lower)
+        found = name_lower in text_lower or name_plain in text_plain
+        _verified_cache[cache_key] = found
+        return found
+    except Exception as e:
+        logger.debug(f"Client link verification failed ({url}): {e}")
+        _verified_cache[cache_key] = False
+        return False
+
+
+async def _verify_clients(clients: List[Dict[str, str]], agency_name: str) -> List[Dict[str, str]]:
+    """Verify a list of client candidates in parallel, keeping only verified ones."""
+    if not clients:
+        return []
+    results = await asyncio.gather(
+        *[_averify_client_link(c, agency_name) for c in clients],
+        return_exceptions=True,
+    )
+    return [
+        c for c, ok in zip(clients, results)
+        if ok and not isinstance(ok, Exception)
+    ]
+
+
+async def _afetch_awwwards_portfolio(agency_name: str, progress_cb=None) -> List[Dict[str, str]]:
+    """Search Awwwards for the agency and extract linked project sites."""
+    results = await asearch_query(f'site:awwwards.com "{agency_name}"', max_results=3)
+    clients = []
+    for r in results:
+        link = r.get("link", "")
+        if "awwwards.com" not in link:
+            continue
+        snippet = r.get("snippet", "") + " " + r.get("title", "")
+        for m in re.finditer(r'https?://[^\s<>"]+', snippet):
+            url = m.group(0)
+            parsed = urlparse(url)
+            if parsed.netloc and not any(
+                parsed.netloc == d or parsed.netloc.endswith("." + d) for d in _IGNORE_DOMAINS_SET
+            ):
+                clean_domain = parsed.netloc.lower()
+                clean_domain = clean_domain[4:] if clean_domain.startswith("www.") else clean_domain
+                clients.append({
+                    "domain": clean_domain,
+                    "url": url,
+                    "source": "awwwards.com",
+                })
+    return clients
+
+
+async def _afetch_designrush_profile(agency_name: str, progress_cb=None) -> List[Dict[str, str]]:
+    """Search DesignRush for the agency and extract client/portfolio links."""
+    results = await asearch_query(f'site:designrush.com "{agency_name}"', max_results=3)
+    clients = []
+    for r in results:
+        link = r.get("link", "")
+        if "designrush.com" not in link:
+            continue
+        snippet = r.get("snippet", "") + " " + r.get("title", "")
+        for m in re.finditer(r'https?://[^\s<>"]+', snippet):
+            url = m.group(0)
+            parsed = urlparse(url)
+            if parsed.netloc and not any(
+                parsed.netloc == d or parsed.netloc.endswith("." + d) for d in _IGNORE_DOMAINS_SET
+            ):
+                clean_domain = parsed.netloc.lower()
+                clean_domain = clean_domain[4:] if clean_domain.startswith("www.") else clean_domain
+                clients.append({
+                    "domain": clean_domain,
+                    "url": url,
+                    "source": "designrush.com",
+                })
+    return clients
+
+
+async def _afetch_themanifest_profile(agency_name: str, progress_cb=None) -> List[Dict[str, str]]:
+    """Search The Manifest for the agency and extract client/portfolio links."""
+    results = await asearch_query(f'site:themanifest.com "{agency_name}"', max_results=3)
+    clients = []
+    for r in results:
+        link = r.get("link", "")
+        if "themanifest.com" not in link:
+            continue
+        snippet = r.get("snippet", "") + " " + r.get("title", "")
+        for m in re.finditer(r'https?://[^\s<>"]+', snippet):
+            url = m.group(0)
+            parsed = urlparse(url)
+            if parsed.netloc and not any(
+                parsed.netloc == d or parsed.netloc.endswith("." + d) for d in _IGNORE_DOMAINS_SET
+            ):
+                clean_domain = parsed.netloc.lower()
+                clean_domain = clean_domain[4:] if clean_domain.startswith("www.") else clean_domain
+                clients.append({
+                    "domain": clean_domain,
+                    "url": url,
+                    "source": "themanifest.com",
+                })
+    return clients
+
+
+async def _afetch_agenzie_digitali(agency_name: str, progress_cb=None) -> List[Dict[str, str]]:
+    """Search Italian digital agency directories for portfolio mentions."""
+    queries = [
+        f'"{agency_name}" agenzia digitale portfolio',
+        f'"{agency_name}" "realizzato da" OR "progetto" OR "portfolio"',
+    ]
+    clients = []
+    seen_domains: set = set()
+    for q in queries:
+        try:
+            results = await asearch_query(q, max_results=5)
+        except Exception:
+            continue
+        for r in results:
+            link = r.get("link", "")
+            parsed = urlparse(link)
+            if not parsed.netloc:
+                continue
+            clean_domain = parsed.netloc.lower()
+            clean_domain = clean_domain[4:] if clean_domain.startswith("www.") else clean_domain
+            if clean_domain in seen_domains:
+                continue
+            is_ignored = any(
+                clean_domain == d or clean_domain.endswith("." + d) for d in _IGNORE_DOMAINS_SET
+            )
+            if is_ignored:
+                continue
+            seen_domains.add(clean_domain)
+            clients.append({
+                "domain": clean_domain,
+                "url": f"{parsed.scheme}://{parsed.netloc}",
+                "source": "generic_search",
+            })
+    return clients
+
+
 async def aexternal_portfolio_lookup(
     agency_name: str,
     linkedin_company_url: str = "",
@@ -575,6 +769,10 @@ async def aexternal_portfolio_lookup(
         _afetch_dribbble_portfolio(agency_name, progress_cb),
         _afetch_linkedin_case_studies(linkedin_company_url, progress_cb),
         _afetch_generic_portfolio(agency_name, progress_cb),
+        _afetch_awwwards_portfolio(agency_name, progress_cb),
+        _afetch_designrush_profile(agency_name, progress_cb),
+        _afetch_themanifest_profile(agency_name, progress_cb),
+        _afetch_agenzie_digitali(agency_name, progress_cb),
     ]
 
     results_list = await asyncio.gather(*tasks, return_exceptions=True)
@@ -590,7 +788,15 @@ async def aexternal_portfolio_lookup(
                 seen.add(domain)
                 merged.append(item)
 
-    return merged
+    verified = await _verify_clients(merged, agency_name)
+
+    SOURCE_PRIORITY = {
+        "clutch.co": 5, "awwwards.com": 5, "behance.net": 4,
+        "dribbble.com": 4, "designrush.com": 4, "themanifest.com": 3,
+        "linkedin.com": 3, "generic_search": 1,
+    }
+    verified.sort(key=lambda c: (SOURCE_PRIORITY.get(c.get("source"), 0), c.get("domain", "")), reverse=True)
+    return verified[:30]
 
 
 async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, progress_cb=None) -> Dict[str, Any]:
@@ -691,25 +897,37 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
         if progress_cb:
             progress_cb(f"Evaluating {len(candidates)} candidate websites...")
         scored_candidates = list(await asyncio.gather(*[_ascore_website(url, query_name) for url in candidates]))
-        scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+        scored_candidates.sort(key=lambda x: (x["score"], -len(x["url"])), reverse=True)
         candidate_log = [f'{s["url"]} (score={s["score"]})' for s in scored_candidates]
         logger.info(f"Website candidates: {candidate_log}")
         for sc in scored_candidates:
             if sc["score"] >= 0:
-                result["website"] = sc["url"]
+                result["website"] = sc["final_url"] or sc["url"]
                 break
 
     if not result["website"]:
+        name_lower_fb = (query_name or "").lower()
+        name_words_fb = [w for w in name_lower_fb.split() if len(w) > 2]
         for r in relevant:
             link = r.get("link", "")
             parsed = urlparse(link)
             domain = parsed.netloc.lower()
             clean_domain = domain[4:] if domain.startswith("www.") else domain
             is_ignored = any(clean_domain == d or clean_domain.endswith("." + d) for d in IGNORE_DOMAINS)
-            if not is_ignored and parsed.scheme in ("http", "https"):
-                result["website"] = f"{parsed.scheme}://{parsed.netloc}"
-                logger.info(f"Fallback website (no scored candidate): {result['website']}")
-                break
+            if is_ignored or parsed.scheme not in ("http", "https"):
+                continue
+            haystack = (r.get("title", "") + " " + r.get("snippet", "")).lower()
+            name_found = name_lower_fb in haystack if name_lower_fb else False
+            name_words_found = any(w in haystack for w in name_words_fb) if name_words_fb else False
+            if not name_found and not name_words_found:
+                logger.debug(f"Fallback website skipped (name not in snippet): {clean_domain}")
+                continue
+            result["website"] = f"{parsed.scheme}://{parsed.netloc}"
+            logger.info(f"Fallback website (name-verified): {result['website']}")
+            break
+        else:
+            if query_name:
+                logger.warning(f"No verified website found for '{query_name}'")
 
     website_domain = urlparse(result["website"]).netloc.replace("www.", "") if result["website"] else ""
     size_regexes = [
@@ -767,19 +985,26 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
             c["source"] = "company_page"
 
         search_contacts = await afind_linkedin_employees(
-            query_name, result["linkedin_company_url"], website_domain, max_results=15
+            query_name, result["linkedin_company_url"], website_domain, max_results=20
         )
         for c in search_contacts:
             c["source"] = "company_page"
 
+        all_contacts = page_contacts + search_contacts
         seen_urls: set = set()
-        merged: List[Dict[str, Any]] = []
-        for c in page_contacts + search_contacts:
+        deduped: List[Dict[str, Any]] = []
+        for c in all_contacts:
             key = c["url"].rstrip("/")
             if key not in seen_urls:
                 seen_urls.add(key)
-                merged.append(c)
-        result["linkedin_contacts"] = merged[:15]
+                deduped.append(c)
+
+        deduped.sort(key=lambda c: (
+            _role_tier(c.get("role", "")),
+            0 if c.get("source") == "company_page" else 1,
+            c.get("name", "").lower(),
+        ))
+        result["linkedin_contacts"] = deduped[:20]
 
     if result["linkedin_company_url"]:
         broad_contacts: List[Dict[str, Any]] = []
@@ -829,7 +1054,7 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
     external_news_task = None
     if query_name:
         if progress_cb:
-            progress_cb("Searching external sources for portfolio/client sites (Clutch, Behance, Dribbble, LinkedIn, general)...")
+            progress_cb("Searching external sources for portfolio/client sites (Clutch, Behance, Dribbble, LinkedIn, Awwwards, DesignRush, The Manifest)...")
         external_portfolio_task = asyncio.ensure_future(
             aexternal_portfolio_lookup(query_name, result.get("linkedin_company_url", ""), progress_cb)
         )
@@ -869,7 +1094,7 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
                         result["portfolio_sites"].append(d)
                         existing.add(d)
                 result["portfolio_detail"] = external_clients
-                logger.info(f"External portfolio lookup found {len(external_clients)} client domains")
+                logger.info(f"Verified portfolio lookup found {len(external_clients)} client domains")
         except Exception as e:
             logger.warning(f"External portfolio lookup failed: {e}")
 
@@ -923,8 +1148,8 @@ async def alookup_agency(name: Optional[str] = None, vat: Optional[str] = None, 
         if progress_cb:
             progress_cb(f"Performing fallback LinkedIn contact search for '{query_name}'...")
         logger.info(f"Targeted LinkedIn search (fallback): {query_name}")
-        people_query = f'site:linkedin.com/in "{query_name}" CEO Founder CTO'
-        people_results = await asearch_query(people_query, max_results=5)
+        people_query = f'site:linkedin.com/in "{query_name}" ({ROLE_CLAUSE})'
+        people_results = await asearch_query(people_query, max_results=10)
         relevant_people = _filter_relevant(people_results, query_name)
 
         seen_urls = set()

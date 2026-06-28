@@ -1,5 +1,6 @@
 import os
 import httpx
+import unicodedata
 
 try:
     import certifi
@@ -19,3 +20,8 @@ def make_async_client(timeout: int = 15) -> httpx.AsyncClient:
         follow_redirects=True,
         headers={"User-Agent": USER_AGENT},
     )
+
+
+def strip_diacritics(s: str) -> str:
+    """Strip diacritics/accent marks from a string."""
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
