@@ -13,6 +13,16 @@ from .utils import _browser_headers
 
 logger = logging.getLogger("agency_finder.search")
 
+try:
+    from ddgs import DDGS
+    from ddgs.exceptions import RatelimitException, TimeoutException as DDGTimeoutException
+    _DDG_EXCEPTIONS_AVAILABLE = True
+except ImportError:
+    DDGS = None
+    RatelimitException = Exception
+    DDGTimeoutException = Exception
+    _DDG_EXCEPTIONS_AVAILABLE = False
+
 search_cache: Dict[str, Tuple[float, List[Dict[str, str]]]] = {}
 CACHE_TTL = 300
 
@@ -112,114 +122,211 @@ def _set_error(msg: str):
 
 async def _asearch_ddg_lite(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     url = "https://lite.duckduckgo.com/lite/"
-    headers = _rand_headers("ddg")
-    headers["Content-Type"] = "application/x-www-form-urlencoded"
-    headers["Referer"] = "https://lite.duckduckgo.com/"
 
-    try:
-        response = await _aretry(url, method="POST", data={"q": query}, headers=headers)
-        if response is None:
-            _set_error("DuckDuckGo Lite search failed after retries (network error).")
-            return []
-        if response.status_code != 200:
-            _set_error(f"DuckDuckGo Lite search returned HTTP {response.status_code}.")
-            return []
-        if _is_captcha(response.text):
-            _set_error("DuckDuckGo is blocking the search (CAPTCHA or rate limit).")
-            return []
+    for attempt in range(2):
+        headers = _rand_headers("ddg")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        headers["Referer"] = "https://lite.duckduckgo.com/"
 
-        soup = BeautifulSoup(response.content, "html.parser")
-        links = soup.find_all("a", class_="result-link")
-        if not links:
-            _set_error("DuckDuckGo Lite returned no results for this query.")
-            return []
+        try:
+            response = await _aretry(url, method="POST", data={"q": query}, headers=headers)
+            if response is None:
+                if attempt == 0:
+                    logger.warning("DuckDuckGo Lite returned no response, retrying with fresh headers")
+                    await asyncio.sleep(0.5)
+                    continue
+                _set_error("DuckDuckGo Lite search failed after retries (network error).")
+                return []
+            if response.status_code != 200:
+                if attempt == 0:
+                    logger.warning(f"DuckDuckGo Lite HTTP {response.status_code}, retrying")
+                    await asyncio.sleep(0.5)
+                    continue
+                _set_error(f"DuckDuckGo Lite search returned HTTP {response.status_code}.")
+                return []
+            if _is_captcha(response.text):
+                if attempt == 0:
+                    logger.warning("DuckDuckGo Lite captcha, retrying with fresh headers")
+                    await asyncio.sleep(0.5)
+                    continue
+                _set_error("DuckDuckGo is blocking the search (CAPTCHA or rate limit).")
+                return []
 
-        results = []
-        snippets = soup.find_all("td", class_="result-snippet")
-        for idx, link_tag in enumerate(links[:max_results]):
-            title = link_tag.get_text(strip=True)
-            link = link_tag.get("href", "")
-            snippet = ""
-            if idx < len(snippets):
-                snippet = snippets[idx].get_text().strip()
-                snippet = re.sub(r"\s+", " ", snippet)
-            results.append({"title": title, "link": link, "snippet": snippet})
-        return results
-    except Exception as e:
-        logger.error(f"DuckDuckGo Lite scrape error: {e}")
-        return []
+            soup = BeautifulSoup(response.content, "html.parser")
+            links = soup.find_all("a", class_="result-link")
+            if not links:
+                if attempt == 0:
+                    logger.warning("DuckDuckGo Lite no results, retrying with fresh headers")
+                    await asyncio.sleep(0.5)
+                    continue
+                _set_error("DuckDuckGo Lite returned no results for this query.")
+                return []
+
+            results = []
+            snippets = soup.find_all("td", class_="result-snippet")
+            for idx, link_tag in enumerate(links[:max_results]):
+                title = link_tag.get_text(strip=True)
+                link = link_tag.get("href", "")
+                snippet = ""
+                if idx < len(snippets):
+                    snippet = snippets[idx].get_text().strip()
+                    snippet = re.sub(r"\s+", " ", snippet)
+                results.append({"title": title, "link": link, "snippet": snippet})
+            return results
+        except Exception as e:
+            if attempt == 0:
+                logger.warning(f"DuckDuckGo Lite error: {e}, retrying")
+                await asyncio.sleep(0.5)
+                continue
+            logger.error(f"DuckDuckGo Lite scrape error: {e}")
+            return []
+    return []
 
 
 async def _asearch_duckduckgo(query: str, max_results: int = 10) -> List[Dict[str, str]]:
-    try:
-        from ddgs import DDGS
+    headers = _browser_headers("ddg")
+    for backend in ("auto", "html", "lite"):
+        try:
+            def _run():
+                with DDGS(headers=headers, timeout=Config.TIMEOUT) as ddgs:
+                    return list(ddgs.text(query, region="it-it", backend=backend, max_results=max_results))
 
-        def _run_ddg():
-            with DDGS(timeout=Config.TIMEOUT) as ddgs:
-                return list(ddgs.text(query, max_results=max_results))
-
-        ddg_results = await asyncio.to_thread(_run_ddg)
-        if ddg_results:
-            return [
-                {
-                    "title": r.get("title", ""),
-                    "link": r.get("href", ""),
-                    "snippet": r.get("body", ""),
-                }
-                for r in ddg_results
-            ]
-    except Exception as e:
-        logger.error(f"DuckDuckGo library error: {e}")
-
+            ddg_results = await asyncio.to_thread(_run)
+            if ddg_results:
+                return [
+                    {
+                        "title": r.get("title", ""),
+                        "link": r.get("href", ""),
+                        "snippet": r.get("body", ""),
+                    }
+                    for r in ddg_results
+                ]
+            logger.info(f"DDG backend '{backend}' returned no results")
+        except RatelimitException:
+            logger.warning(f"DDG backend '{backend}' rate limited")
+        except DDGTimeoutException:
+            logger.warning(f"DDG backend '{backend}' timed out")
+        except Exception as e:
+            logger.warning(f"DDG backend '{backend}' error: {e}")
+        await asyncio.sleep(0.5)
     return []
 
 
 async def _asearch_ddg_html(query: str, max_results: int = 10) -> List[Dict[str, str]]:
     url = "https://html.duckduckgo.com/html/"
-    headers = _rand_headers("ddg")
-    headers["Referer"] = "https://duckduckgo.com/"
 
-    try:
-        response = await _aretry(url, params={"q": query}, headers=headers)
-        if response is None:
-            _set_error("DuckDuckGo HTML search failed after retries (network error).")
-            return []
-        if response.status_code != 200:
-            _set_error(f"DuckDuckGo HTML search returned HTTP {response.status_code}.")
-            return []
-        if _is_captcha(response.text):
-            _set_error("DuckDuckGo is blocking the search (CAPTCHA or rate limit). Try again later or use a different search backend.")
-            return []
+    for attempt in range(2):
+        headers = _rand_headers("ddg")
+        headers["Referer"] = "https://duckduckgo.com/"
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        search_divs = soup.find_all("div", class_="result")
-        if not search_divs:
-            if soup.find("div", class_="no-results"):
-                _set_error("DuckDuckGo returned no results for this query.")
-            else:
-                _set_error("DuckDuckGo HTML structure may have changed — could not parse results.")
-            return []
+        try:
+            response = await _aretry(url, params={"q": query}, headers=headers)
+            if response is None:
+                if attempt == 0:
+                    logger.warning("DuckDuckGo HTML returned no response, retrying with fresh headers")
+                    await asyncio.sleep(0.5)
+                    continue
+                _set_error("DuckDuckGo HTML search failed after retries (network error).")
+                return []
+            if response.status_code != 200:
+                if attempt == 0:
+                    logger.warning(f"DuckDuckGo HTML HTTP {response.status_code}, retrying")
+                    await asyncio.sleep(0.5)
+                    continue
+                _set_error(f"DuckDuckGo HTML search returned HTTP {response.status_code}.")
+                return []
+            if _is_captcha(response.text):
+                if attempt == 0:
+                    logger.warning("DuckDuckGo HTML captcha, retrying with fresh headers")
+                    await asyncio.sleep(0.5)
+                    continue
+                _set_error("DuckDuckGo is blocking the search (CAPTCHA or rate limit). Try again later or use a different search backend.")
+                return []
 
-        results = []
-        for div in search_divs[:max_results]:
-            title_a = div.find("a", class_="result__a")
-            if not title_a:
+            soup = BeautifulSoup(response.text, "html.parser")
+            search_divs = soup.find_all("div", class_="result")
+            if not search_divs:
+                if attempt == 0:
+                    logger.warning("DuckDuckGo HTML no results, retrying with fresh headers")
+                    await asyncio.sleep(0.5)
+                    continue
+                if soup.find("div", class_="no-results"):
+                    _set_error("DuckDuckGo returned no results for this query.")
+                else:
+                    _set_error("DuckDuckGo HTML structure may have changed — could not parse results.")
+                return []
+
+            results = []
+            for div in search_divs[:max_results]:
+                title_a = div.find("a", class_="result__a")
+                if not title_a:
+                    continue
+                title = title_a.get_text(strip=True)
+                raw_link = title_a.get("href", "")
+                link = raw_link
+                if "/l/?" in raw_link:
+                    parsed_url = urllib.parse.urlparse(raw_link)
+                    queries = urllib.parse.parse_qs(parsed_url.query)
+                    if "uddg" in queries:
+                        link = queries["uddg"][0]
+                snippet_a = div.find("a", class_="result__snippet")
+                snippet = snippet_a.get_text(strip=True) if snippet_a else ""
+                results.append({"title": title, "link": link, "snippet": snippet})
+            return results
+        except Exception as e:
+            if attempt == 0:
+                logger.warning(f"DuckDuckGo HTML error: {e}, retrying")
+                await asyncio.sleep(0.5)
                 continue
-            title = title_a.get_text(strip=True)
-            raw_link = title_a.get("href", "")
-            link = raw_link
-            if "/l/?" in raw_link:
-                parsed_url = urllib.parse.urlparse(raw_link)
-                queries = urllib.parse.parse_qs(parsed_url.query)
-                if "uddg" in queries:
-                    link = queries["uddg"][0]
-            snippet_a = div.find("a", class_="result__snippet")
-            snippet = snippet_a.get_text(strip=True) if snippet_a else ""
-            results.append({"title": title, "link": link, "snippet": snippet})
-        return results
-    except Exception as e:
-        logger.error(f"DuckDuckGo HTML scrape error: {e}")
+            logger.error(f"DuckDuckGo HTML scrape error: {e}")
+            return []
+    return []
+
+
+def _slugify_name(name: str) -> Tuple[str, str]:
+    from .utils import strip_diacritics
+    cleaned = strip_diacritics(name.lower())
+    no_space = re.sub(r"[^a-z0-9]", "", cleaned)
+    hyphen = re.sub(r"[^a-z0-9]+", "-", cleaned).strip("-")
+    return no_space, hyphen
+
+
+def _extract_title(html: str) -> str:
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1).strip())
+    return ""
+
+
+async def _aguess_direct_domains(query: str, max_results: int = 10) -> List[Dict[str, str]]:
+    first_token = query.split()[0] if query else ""
+    name = re.sub(r"[^A-Za-zÀ-ÿ0-9 ]", "", first_token).strip()
+    if len(name) < 3:
         return []
+    no_space, hyphen = _slugify_name(name)
+    if not no_space:
+        return []
+    candidates = [
+        f"https://{no_space}.it",
+        f"https://www.{no_space}.it",
+        f"https://{hyphen}.it",
+        f"https://www.{hyphen}.it",
+        f"https://{no_space}.com",
+        f"https://{hyphen}.com",
+    ]
+    seen = set()
+    for url in candidates:
+        if url in seen or not url:
+            continue
+        seen.add(url)
+        try:
+            resp = await _aretry(url, method="GET", timeout=6, max_retries=0)
+            if resp and resp.status_code == 200 and not _is_captcha(resp.text):
+                title = _extract_title(resp.text) or url
+                return [{"title": title, "link": url, "snippet": "Direct domain guess"}]
+        except Exception:
+            continue
+    return []
 
 
 async def _asearch_bing_html(query: str, max_results: int = 10) -> List[Dict[str, str]]:
@@ -356,10 +463,13 @@ async def asearch_query(query: str, max_results: int = 10) -> List[Dict[str, str
         tasks.append(asyncio.create_task(_asearch_google_custom(query, max_results)))
 
     tasks.append(asyncio.create_task(_asearch_duckduckgo(query, max_results)))
+    tasks.append(asyncio.create_task(_asearch_ddg_lite(query, max_results)))
+    tasks.append(asyncio.create_task(_asearch_ddg_html(query, max_results)))
     tasks.append(asyncio.create_task(_asearch_bing_html(query, max_results)))
+    tasks.append(asyncio.create_task(_aguess_direct_domains(query, max_results)))
 
     try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED, timeout=10)
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED, timeout=15)
     except (asyncio.TimeoutError, TimeoutError):
         for t in tasks:
             t.cancel()

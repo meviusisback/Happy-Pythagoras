@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 import xml.etree.ElementTree as ET
@@ -946,22 +947,28 @@ class TestRoleClauseCommercial(unittest.TestCase):
 
 class TestSearchOuterTimeout(unittest.TestCase):
 
-    @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
     @patch("agency_finder.search._asearch_duckduckgo", new_callable=AsyncMock)
-    def test_asearch_completes_within_timeout(self, mock_ddg, mock_bing):
+    @patch("agency_finder.search._asearch_ddg_lite", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_ddg_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._aguess_direct_domains", new_callable=AsyncMock)
+    def test_asearch_completes_within_timeout(self, mock_guess, mock_bing, mock_html, mock_lite, mock_ddg):
         import asyncio
         async def _slow(*a, **kw):
             await asyncio.sleep(200)
             return []
         mock_ddg.side_effect = _slow
+        mock_lite.side_effect = _slow
+        mock_html.side_effect = _slow
         mock_bing.side_effect = _slow
+        mock_guess.side_effect = _slow
         from agency_finder.search import asearch_query
         import time
         t0 = time.time()
-        result = asyncio.run(asyncio.wait_for(asearch_query("test", 3), timeout=15))
+        result = asyncio.run(asyncio.wait_for(asearch_query("test", 3), timeout=20))
         elapsed = time.time() - t0
         self.assertIsInstance(result, list)
-        self.assertLess(elapsed, 15)
+        self.assertLess(elapsed, 20)
 
     @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
     @patch("agency_finder.search._asearch_duckduckgo", new_callable=AsyncMock)
@@ -1130,6 +1137,109 @@ class TestSearchHardening(unittest.TestCase):
         ]
         results = asyncio.run(_asearch_bing_html("test query", 5))
         self.assertEqual(len(results), 1)
+
+
+class TestSearchRobustness(unittest.TestCase):
+
+    @patch("agency_finder.search._asearch_duckduckgo", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_ddg_lite", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_ddg_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._asearch_bing_html", new_callable=AsyncMock)
+    @patch("agency_finder.search._aguess_direct_domains", new_callable=AsyncMock)
+    def test_asearch_query_launches_all_backends(self, mock_guess, mock_bing, mock_html, mock_lite, mock_ddg):
+        from agency_finder.search import asearch_query
+        mock_ddg.return_value = [{"title": "x", "link": "y", "snippet": ""}]
+        mock_lite.return_value = []
+        mock_html.return_value = []
+        mock_bing.return_value = []
+        mock_guess.return_value = []
+        result = asyncio.run(asearch_query("test query", 3))
+        self.assertGreater(len(result), 0)
+        mock_ddg.assert_called_once()
+        mock_lite.assert_called_once()
+        mock_html.assert_called_once()
+        mock_bing.assert_called_once()
+        mock_guess.assert_called_once()
+
+    @patch("agency_finder.search.DDGS")
+    def test_ddg_library_tries_backends_sequentially(self, mock_ddgs_class):
+        from agency_finder.search import _asearch_duckduckgo
+
+        call_log = []
+
+        class FakeDDGS:
+            def __init__(self, *a, **kw):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def text(self, query, **kw):
+                backend = kw.get("backend", "auto")
+                call_log.append(backend)
+                if backend == "auto":
+                    return []
+                return [{"title": "ok", "href": "http://x", "body": "y"}]
+
+        mock_ddgs_class.side_effect = FakeDDGS
+        result = asyncio.run(_asearch_duckduckgo("test", 5))
+        self.assertEqual(len(result), 1)
+        self.assertIn("auto", call_log)
+        self.assertIn("html", call_log)
+
+    @patch("agency_finder.search.DDGS")
+    def test_ddg_library_returns_empty_after_all_backends(self, mock_ddgs_class):
+        from agency_finder.search import _asearch_duckduckgo
+
+        class FakeDDGS:
+            def __init__(self, *a, **kw):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def text(self, query, **kw):
+                return []
+
+        mock_ddgs_class.side_effect = FakeDDGS
+        result = asyncio.run(_asearch_duckduckgo("test", 5))
+        self.assertEqual(result, [])
+
+    @patch("agency_finder.search._aretry")
+    def test_ddg_lite_retries_on_empty(self, mock_aretry):
+        from agency_finder.search import _asearch_ddg_lite
+        empty_resp = MagicMock(status_code=200, text="<html></html>")
+        empty_resp.content = b"<html></html>"
+        good_resp = MagicMock(status_code=200, text="<html><a class='result-link' href='http://x'>Title</a><td class='result-snippet'>snip</td></html>")
+        good_resp.content = b"<html><a class='result-link' href='http://x'>Title</a><td class='result-snippet'>snip</td></html>"
+        mock_aretry.side_effect = [empty_resp, good_resp]
+        result = asyncio.run(_asearch_ddg_lite("test", 5))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(mock_aretry.call_count, 2)
+
+    @patch("agency_finder.search._aretry")
+    def test_direct_domain_guess_finds_website(self, mock_aretry):
+        from agency_finder.search import _aguess_direct_domains
+        mock_aretry.return_value = MagicMock(status_code=200, text="<html><title>Acme</title></html>")
+        result = asyncio.run(_aguess_direct_domains("Acme"))
+        self.assertEqual(len(result), 1)
+        self.assertIn(".it", result[0]["link"])
+
+    @patch("agency_finder.search._aretry")
+    def test_direct_domain_guess_ignores_captcha(self, mock_aretry):
+        from agency_finder.search import _aguess_direct_domains
+        mock_aretry.return_value = MagicMock(status_code=200, text="<html>captcha verify</html>")
+        result = asyncio.run(_aguess_direct_domains("Acme"))
+        self.assertEqual(result, [])
+
+    def test_slugify_name(self):
+        from agency_finder.search import _slugify_name
+        no_space, hyphen = _slugify_name("Cantiere Creativo")
+        self.assertEqual(no_space, "cantierecreativo")
+        self.assertEqual(hyphen, "cantiere-creativo")
+        no_space2, hyphen2 = _slugify_name("Web&Co")
+        self.assertEqual(no_space2, "webco")
+        self.assertEqual(hyphen2, "web-co")
 
 
 if __name__ == "__main__":
